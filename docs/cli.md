@@ -104,8 +104,9 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-Speculative decoding is disabled by default. Select MTP with one to five draft positions, or the
-35B-A3B text-only DFlash backend with one to fifteen. `--lm-head-draft` selects the optimized
+Speculative decoding is disabled by default. Select MTP with one to eight draft positions on 27B
+targets or one to five on 35B-A3B, or select the 35B-A3B-only DFlash backend with one to fifteen.
+`--lm-head-draft` selects the optimized
 proposal head and requires a selected backend:
 
 ```bash
@@ -115,6 +116,25 @@ proposal head and requires a selected backend:
   --max-new 512 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
+```
+
+Add `--adaptive-mtp` to treat `--draft-tokens` as a maximum instead of a fixed verification
+window. The Engine estimates accepted-prefix survival at each draft position with fast and slow
+online filters, scores the predicted output against the measured target-GPU relative-width cost
+curve, then selects one physical verification width for each complete decode batch.
+Predictable stretches can increase toward the configured maximum; low-acceptance stretches reduce
+the width. A new request cohort starts from the qualified prior instead of inheriting another
+request's acceptance regime. Selection uses only completed-round signals and adds no device
+synchronization. An upward
+transition verifies the currently available prefix in the wider profile with a masked tail while
+that same profile produces the wider next proposal, so it needs no separate refill round.
+The adaptive policy is available only with `--spec mtp`.
+
+```bash
+./build/apps/ninfer models/qwen3_8_27b_nvfp4_ostfralla.ninfer \
+  --prompt "Implement a lock-free single-producer queue in C++." \
+  --max-context 8192 --max-new 512 \
+  --spec mtp --draft-tokens 5 --adaptive-mtp --lm-head-draft
 ```
 
 For DFlash:
@@ -144,8 +164,9 @@ measured recommendation rather than a semantic limit.
 | `--kv-dtype bf16\|int8\|hq-e8-2b` | KV-cache storage | `bf16` |
 | `--rope-scaling none\|yarn:F[,t=c][,bf=n][,bs=n]` | text RoPE position scaling; `yarn:2`/`yarn:4` select YaRN with that factor (HF/vLLM semantics). Optional fields: `t` the attention temperature coefficient (attention factor = `t·ln F + 1`, default 0.1), `bf`/`bs` the ramp bounds beta_fast/beta_slow (defaults 32/1) | `none` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
+| `--draft-tokens N` | 27B MTP `1..8`; 35B-A3B MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--adaptive-mtp` | dynamically select MTP verification width up to `--draft-tokens` | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |

@@ -134,7 +134,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .conv_dtype     = DType::BF16,
                          },
                  });
-    if (plan.speculative_backend != SpeculativeBackend::None) {
+    if (plan.speculative_backend == SpeculativeBackend::Mtp) {
+        const std::uint32_t first_window =
+            plan.mtp_policy == MtpDraftPolicy::Adaptive ? 1U : plan.draft_window;
+        for (std::uint32_t window = first_window; window <= plan.draft_window; ++window) {
+            out.mtp_replay_records[window - 1U] = plan_gdn_replay_records(
+                builder, GdnReplayRecordSpec{
+                             .layers          = TextConfig::gdn_layers(),
+                             .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
+                             .width           = static_cast<std::int32_t>(window + 1U),
+                             .conv_channels   = TextConfig::convolution_dim,
+                             .qk_heads        = TextConfig::gdn_key_heads,
+                             .value_heads     = TextConfig::gdn_value_heads,
+                             .key_dim         = TextConfig::gdn_key_head_dim,
+                             .value_dim       = TextConfig::gdn_value_head_dim,
+                         });
+        }
+    } else if (plan.speculative_backend == SpeculativeBackend::DFlash) {
         out.replay_records = plan_gdn_replay_records(
             builder, GdnReplayRecordSpec{
                          .layers          = TextConfig::gdn_layers(),
@@ -195,9 +211,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         builder, qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
                                          .output_rows    = TextConfig::output_rows,
                                          .batch_capacity = plan.max_concurrency,
-                                         .draft_window   = plan.draft_window,
-                                         .enable_mtp     = plan.features.mtp(),
-                                         .enable_dflash  = plan.features.dflash()});
+                                          .draft_window   = plan.draft_window,
+                                          .enable_mtp     = plan.features.mtp(),
+                                          .enable_dflash  = plan.features.dflash(),
+                                          .adaptive_mtp =
+                                              plan.mtp_policy == MtpDraftPolicy::Adaptive});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
     qwen3_6::complete_round_state_layout(builder, out.round);
@@ -605,7 +623,8 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
-            options.speculative.proposal_head != ProposalHead::Full) {
+            options.speculative.proposal_head != ProposalHead::Full ||
+            options.speculative.mtp_policy != MtpDraftPolicy::Fixed) {
             throw std::invalid_argument(
                 "disabled speculative decoding requires draft_tokens=0 and the full proposal head");
         }
@@ -613,7 +632,12 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     case SpeculativeBackend::Mtp:
         if (options.speculative.draft_tokens == 0 ||
             options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
-            throw std::invalid_argument("MTP draft window must be in [1,5]");
+            throw std::invalid_argument("MTP draft window must be in [1," +
+                                        std::to_string(kMaximumMtpDraftTokens) + "]");
+        }
+        if (options.speculative.mtp_policy != MtpDraftPolicy::Fixed &&
+            options.speculative.mtp_policy != MtpDraftPolicy::Adaptive) {
+            throw std::invalid_argument("invalid MTP draft policy");
         }
         break;
     case SpeculativeBackend::DFlash:
@@ -626,6 +650,9 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         if (options.enable_vision) {
             throw std::invalid_argument("DFlash and Vision cannot be enabled together");
+        }
+        if (options.speculative.mtp_policy != MtpDraftPolicy::Fixed) {
+            throw std::invalid_argument("adaptive MTP requires the MTP backend");
         }
         break;
     }
@@ -651,6 +678,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->draft_window        = inputs.draft_window;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
+    impl->mtp_policy          = inputs.mtp_policy;
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->device              = inputs.device;
@@ -692,26 +720,44 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(per_batch, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
-            const std::size_t per_batch_allowance = graph_topology_allowance(
-                profiles,
-                [&](GraphExecutionProfile profile) {
-                    const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    // Measured instantiation per big-visible class: <=262144 keys fits the
-                    // historical 82 MiB; the split-grid step past it measured 427-437 MiB at
-                    // ~304k visible keys after WI-2 banding. The 1M-envelope tier is a
-                    // conservative extrapolation, not a measurement.
-                    const std::uint64_t tier = final_visible <= 4096        ? 12ULL
-                                               : final_visible <= 262144    ? 160ULL
-                                               : final_visible <= 524288    ? 512ULL
-                                                                             : 1024ULL;
-                    return tier * kMiB;
-                },
-                "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
+            // Measured instantiation per big-visible class: <=262144 keys fits 160 MiB (measured
+            // on this RTX 5090 with CUDA 13.1, see the Windows build notes); the split-grid step
+            // past it measured 427-437 MiB at ~304k visible keys after WI-2 banding. The
+            // 1M-envelope tier is a conservative extrapolation, not a measurement.
+            const auto tier_bytes = [](std::uint64_t final_visible) {
+                const std::uint64_t tier = final_visible <= 4096        ? 12ULL
+                                           : final_visible <= 262144    ? 160ULL
+                                           : final_visible <= 524288    ? 512ULL
+                                                                         : 1024ULL;
+                return tier * kMiB;
+            };
+            const auto batch_allowance = [&](std::uint32_t batch_size) {
+                std::size_t allowance = 0;
+                const std::uint32_t first_window =
+                    impl->mtp_policy == MtpDraftPolicy::Adaptive ? 1U : impl->draft_window;
+                for (std::uint32_t verification_window = first_window;
+                     verification_window <= impl->draft_window; ++verification_window) {
+                    const auto profiles =
+                        mtp_graph_profiles(impl->capacity, verification_window, batch_size);
+                    const std::size_t window_allowance = graph_topology_allowance(
+                        profiles,
+                        [&](GraphExecutionProfile profile) {
+                            const std::uint64_t final_visible = std::min<std::uint64_t>(
+                                impl->capacity, static_cast<std::uint64_t>(profile.max) +
+                                                    2ULL * verification_window);
+                            return tier_bytes(final_visible);
+                        },
+                        "MTP graph allowance");
+                    allowance = checked_add(allowance, window_allowance,
+                                            "adaptive MTP graph allowance");
+                }
+                return allowance;
+            };
+            for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
+                impl->graph_allowance_bytes =
+                    checked_add(impl->graph_allowance_bytes, batch_allowance(batch_size),
+                                "MTP exact-b graph allowance");
+            }
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles =
@@ -780,6 +826,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .rope_scaling_temperature = options.rope_scaling_temperature,
         .rope_scaling_beta_fast   = options.rope_scaling_beta_fast,
         .rope_scaling_beta_slow   = options.rope_scaling_beta_slow,
+        .mtp_policy     = options.speculative.mtp_policy,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,
         .device         = options.device,

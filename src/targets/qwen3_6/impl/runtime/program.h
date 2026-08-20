@@ -13,6 +13,7 @@
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#include "targets/qwen3_6/impl/runtime/mtp_adaptive.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -134,6 +135,7 @@ struct SequenceKVBundle {
 
 struct DecodeGraphProfile {
     std::uint32_t batch_size             = 1;
+    std::uint32_t verification_window    = 0;
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
     std::uint32_t topology_class         = 0;
@@ -184,6 +186,8 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
+    qwen3_6::detail::MtpAdaptiveSignal mtp_signal;
+    std::uint64_t adaptive_epoch = 0;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -273,6 +277,7 @@ public:
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
     const ProposalHead proposal_head;
+    const MtpDraftPolicy mtp_policy;
     const bool vision_enabled;
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
@@ -285,6 +290,8 @@ public:
     DeviceArena workspace_storage;
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
+    std::array<std::optional<GdnReplayRecords>, qwen3_6::kMtpDecodeMaximumDrafts>
+        mtp_replay_records;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
@@ -300,6 +307,10 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
+    qwen3_6::detail::MtpAdaptiveBatchController mtp_controller;
+    std::uint32_t pending_mtp_window = 0;
+    std::uint32_t pending_mtp_batch_size = 0;
+    std::uint64_t next_adaptive_epoch = 0;
 
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;

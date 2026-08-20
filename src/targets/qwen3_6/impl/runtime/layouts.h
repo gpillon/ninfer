@@ -12,6 +12,7 @@
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -37,6 +38,8 @@ struct DFlashPersistentLayout {
 
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
+    std::array<std::optional<GdnReplayRecordLayout>, qwen3_6::kMtpDecodeMaximumDrafts>
+        mtp_replay_records;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_6::RoundStateLayout round;
@@ -77,6 +80,7 @@ struct SequencePlanningInputs {
     float rope_scaling_temperature         = 0.1F;
     float rope_scaling_beta_fast           = 32.0F;
     float rope_scaling_beta_slow           = 1.0F;
+    MtpDraftPolicy mtp_policy              = MtpDraftPolicy::Fixed;
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;
@@ -105,6 +109,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     float rope_scaling_beta_fast           = 32.0F;
     float rope_scaling_beta_slow           = 1.0F;
     ops::RopeFrequencies text_rope;
+    MtpDraftPolicy mtp_policy              = MtpDraftPolicy::Fixed;
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;
