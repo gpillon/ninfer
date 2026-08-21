@@ -42,13 +42,20 @@ std::string format_bytes(std::size_t bytes) {
 } // namespace
 
 int main(int argc, char** argv) {
+    ninfer::serve::ServeOptions options;
     try {
-        ninfer::serve::ServeOptions options = ninfer::serve::parse_serve_options(argc, argv);
-        if (options.help_requested) {
-            std::cout << ninfer::serve::serve_usage_text(argv[0]);
-            return 0;
-        }
+        options = ninfer::serve::parse_serve_options(argc, argv);
+    } catch (const std::exception& exception) {
+        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error, exception.what());
+        std::cerr << ninfer::serve::serve_usage_text(argv[0]);
+        return 1;
+    }
+    if (options.help_requested) {
+        std::cout << ninfer::serve::serve_usage_text(argv[0]);
+        return 0;
+    }
 
+    try {
         // Resolve (and, in --webui mode, auto-download) the webui directory before
         // the port is taken so a failed download aborts startup cleanly. In
         // --webui-dir mode the directory is trusted to already hold a built UI;
@@ -144,7 +151,6 @@ int main(int argc, char** argv) {
         return 0;
     } catch (const std::exception& exception) {
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error, exception.what());
-        std::cerr << ninfer::serve::serve_usage_text(argv[0]);
         return 1;
     }
 }
