@@ -253,7 +253,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
 
-std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() const {
+std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime(
+    std::optional<std::chrono::milliseconds> timeout_override) const {
     const auto started = Clock::now();
     {
         std::lock_guard lock(request_capacity_->mutex);
@@ -263,10 +264,10 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
         }
         ++request_capacity_->active;
     }
+    const auto timeout =
+        timeout_override.value_or(std::chrono::milliseconds(options_.pending_timeout_ms));
     try {
-        return std::make_shared<RequestLifetime>(
-            request_capacity_, started,
-            started + std::chrono::milliseconds(options_.pending_timeout_ms));
+        return std::make_shared<RequestLifetime>(request_capacity_, started, started + timeout);
     } catch (...) {
         std::lock_guard lock(request_capacity_->mutex);
         --request_capacity_->active;
@@ -274,8 +275,9 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
     }
 }
 
-PreparedRequest GenerationService::prepare(const GenerationRequest& request,
-                                           std::function<bool()> is_cancelled) const {
+PreparedRequest GenerationService::prepare(
+    const GenerationRequest& request, std::function<bool()> is_cancelled,
+    std::optional<std::chrono::milliseconds> timeout_override) const {
     PreparedRequest prepared;
     ninfer::RequestOptions request_options = to_request_options(request, options_);
     prepared.include_usage                 = request.include_usage;
@@ -291,7 +293,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    prepared.lifetime = acquire_request_lifetime();
+    prepared.lifetime = acquire_request_lifetime(timeout_override);
 
     try {
         const auto acquisition_started = Clock::now();
@@ -451,7 +453,11 @@ void GenerationService::warmup() {
         request.messages.push_back(std::move(turn));
         request.max_tokens       = 4;
         request.max_tokens_set   = true;
-        PreparedRequest prepared = prepare(request);
+        // Warmup is internal startup priming and must not inherit the client-facing
+        // request deadline (--pending-timeout-ms bounds incoming-request preparation
+        // and queue waiting, not warmup).
+        constexpr auto kWarmupTimeout = std::chrono::seconds(60);
+        PreparedRequest prepared = prepare(request, {}, kWarmupTimeout);
         run(prepared, nullptr);
     } catch (const std::exception& exception) {
         write_console_log(ConsoleLogLevel::Warning,
