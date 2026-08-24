@@ -21,7 +21,9 @@ namespace ninfer::serve {
 struct ResponseContextNode {
     std::shared_ptr<const ResponseContextNode> parent;
     std::vector<ChatTurn> turns;
-    std::size_t owned_bytes = 0;
+    std::size_t owned_bytes      = 0;
+    std::size_t cumulative_bytes = 0;
+    std::size_t cumulative_turns = 0;
 };
 
 using ResponseContext = std::shared_ptr<const ResponseContextNode>;
@@ -54,9 +56,11 @@ private:
     struct Entry {
         std::shared_ptr<const StoredResponse> response;
         std::list<std::string>::iterator lru;
+        std::size_t envelope_bytes = 0;
     };
 
-    [[nodiscard]] std::size_t recompute_bytes_locked() const;
+    void retain_context_locked(const ResponseContext& context);
+    void release_context_locked(const ResponseContext& context);
     void erase_locked(const std::string& id);
 
     std::size_t max_records_ = 0;
@@ -64,6 +68,7 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<std::string, Entry> records_;
     std::list<std::string> lru_;
+    std::unordered_map<const ResponseContextNode*, std::size_t> live_context_references_;
     std::size_t current_bytes_ = 0;
 };
 
