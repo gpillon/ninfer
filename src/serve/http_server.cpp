@@ -42,7 +42,7 @@ public:
 void write_stream_item(httplib::DataSink& sink, StreamingRequest& request,
                        const std::string& item) {
     if (request.cancelled.load(std::memory_order_acquire) ||
-        (sink.is_writable && !sink.is_writable()) || !sink.write(item.data(), item.size())) {
+        !sink.write(item.data(), item.size())) {
         request.cancelled.store(true, std::memory_order_release);
         throw ClientDisconnected();
     }
