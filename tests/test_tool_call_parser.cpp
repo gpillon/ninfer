@@ -72,7 +72,8 @@ int test_malformed_falls_back_to_text() {
         ninfer::serve::parse_qwen_tool_call_output(text, 64);
     int failures = 0;
     failures += check(!parsed.is_tool_call_response, "malformed xml is not tool response");
-    failures += check(parsed.content == text, "malformed xml preserved as text");
+    failures += check(parsed.content.find("<tool_call>") == std::string::npos,
+                      "malformed xml leaked into content");
     failures += check(parsed.tool_calls.empty(), "malformed xml has no calls");
     return failures;
 }
@@ -151,6 +152,96 @@ int test_incremental_filter_fallback() {
     return failures;
 }
 
+
+int test_trailing_prose_keeps_calls() {
+    // Model narrates after its tool call ("response", analysis text). The well-formed call
+    // must still be salvaged; trailing prose becomes content instead of poisoning the parse.
+    const std::string text = "<tool_call>\n"
+                             "<function=bash>\n"
+                             "<parameter=command>\nls\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "The exit code is 2 because src does not exist.";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "trailing prose keeps tool response");
+    failures += check(parsed.tool_calls.size() == 1, "trailing prose keeps one call");
+    failures += check(parsed.tool_calls[0].name == "bash", "salvaged call name");
+    failures += check(parsed.content.find("exit code is 2") != std::string::npos,
+                      "trailing prose preserved as content");
+    return failures;
+}
+
+int test_prose_between_blocks_salvages_first() {
+    // First block good, then prose, then a second marker that is never closed: first call
+    // survives, prose and fragment become content.
+    const std::string text = "<tool_call>\n"
+                             "<function=a>\n"
+                             "<parameter=x>1</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "thinking out loud <tool_call>\n<function=b>";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "prose between blocks keeps response");
+    failures += check(parsed.tool_calls.size() == 1, "only first block salvaged");
+    failures += check(parsed.tool_calls[0].name == "a", "first block name");
+    failures += check(parsed.content.find("thinking out loud") != std::string::npos &&
+                          parsed.content.find("<tool_call>") != std::string::npos,
+                      "prose and unclosed fragment kept as content");
+    return failures;
+}
+
+int test_all_blocks_bad_drops_xml() {
+    // A single un-closable block is dropped; its raw XML must never leak into content.
+    const std::string text = "prefix\n<tool_call>\n<function=broken>\n<parameter=x>1";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response, "all-bad blocks are not tool calls");
+    failures += check(parsed.tool_calls.empty(), "all-bad blocks yield no calls");
+    failures += check(parsed.content.find("<tool_call>") == std::string::npos,
+                      "malformed block XML leaked into content");
+    failures += check(parsed.content.find("prefix") != std::string::npos,
+                      "prose before blocks was lost");
+    return failures;
+}
+
+int test_malformed_block_dropped_good_neighbors_survive() {
+    const std::string good =
+        "<tool_call>\n<function=bash>\n<parameter=cmd>\nls\n</parameter>\n</function>\n</tool_call>";
+    const std::string bad_tail =
+        "<tool_call>\n<function=bash>\n<parameter=cmd>\nls\n</parameter>\n";
+    const std::string text = good + "\n" + bad_tail + "\nsome prose";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "good block before malformed one was not salvaged");
+    failures += check(parsed.content.find("<tool_call>") == std::string::npos &&
+                          parsed.content.find("</function>") == std::string::npos,
+                      "malformed block XML leaked into content");
+    return failures;
+}
+
+int test_malformed_param_block_dropped() {
+    const std::string text =
+        "note\n<tool_call>\n<function=bash>\n<parameter cmd>\nls\n</parameter>"
+        "\n</function>\n</tool_call>";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                      "single malformed-param block should not parse");
+    failures += check(parsed.content.find("<tool_call>") == std::string::npos,
+                      "malformed-param block XML leaked into content");
+    failures += check(parsed.content.find("note") != std::string::npos,
+                      "prose before the block was lost");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -162,6 +253,11 @@ int main() {
     failures += test_configured_name_limit();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
+    failures += test_malformed_block_dropped_good_neighbors_survive();
+    failures += test_malformed_param_block_dropped();
+    failures += test_trailing_prose_keeps_calls();
+    failures += test_prose_between_blocks_salvages_first();
+    failures += test_all_blocks_bad_drops_xml();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

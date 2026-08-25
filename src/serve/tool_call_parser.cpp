@@ -132,24 +132,64 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     const std::size_t first = text.find(kToolOpen);
     if (first == std::string::npos) { return fallback(text); }
 
+    // Graceful degradation: salvage every complete well-formed block instead of discarding
+    // the whole response. Prose outside blocks is kept as content. A malformed or unclosed
+    // block is dropped silently: its raw XML is never useful to the client, and echoing it
+    // is exactly the tool-call leak this parser exists to prevent.
     ParsedToolCallOutput out;
     out.content = rtrim_ascii(std::string_view(text).substr(0, first));
 
-    std::size_t pos = first;
+    std::size_t pos           = first;
+    bool salvaged_any         = false;
+    std::size_t prose_begin   = first;  // start of not-yet-classified region after last good block
+    std::size_t dropped_from  = std::string::npos;
+
+    auto append_prose = [&](std::size_t upto) {
+        const std::string piece(
+            trim_ascii(std::string_view(text).substr(prose_begin, upto - prose_begin)));
+        if (!piece.empty()) {
+            if (!out.content.empty()) { out.content += "\n\n"; }
+            out.content += piece;
+        }
+    };
+
     while (pos < text.size()) {
         skip_ws(text, pos);
         if (pos >= text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
+        if (!starts_with_at(text, pos, kToolOpen)) {
+            // Prose between or after blocks: keep it, stop scanning blocks.
+            append_prose(text.size());
+            if (salvaged_any) { out.is_tool_call_response = true; }
+            return out;
+        }
         const std::size_t inner_begin = pos + kToolOpen.size();
         const std::size_t close       = text.find(kToolClose, inner_begin);
-        if (close == std::string::npos) { return fallback(text); }
+        if (close == std::string::npos) {
+            // Unclosed block (generation hit the token cap mid-call): drop the fragment,
+            // keep everything before it, stop scanning.
+            dropped_from = pos;
+            break;
+        }
         ToolCall call;
         if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
                                  max_tool_name_length, call)) {
-            return fallback(text);
+            // Malformed block body: drop just this block, keep scanning after it.
+            append_prose(pos);
+            dropped_from = pos;
+            pos          = close + kToolClose.size();
+            prose_begin  = pos;
+            continue;
         }
         out.tool_calls.push_back(std::move(call));
-        pos = close + kToolClose.size();
+        salvaged_any = true;
+        pos          = close + kToolClose.size();
+        prose_begin  = pos;
+    }
+    (void)dropped_from;
+
+    if (!salvaged_any) {
+        // Nothing parsed: never echo the raw blocks; content already holds any prose.
+        return out;
     }
 
     if (out.tool_calls.empty()) { return fallback(text); }
