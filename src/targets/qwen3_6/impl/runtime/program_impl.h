@@ -181,7 +181,12 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
-      max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
+      rope_frequencies(plan.text_rope), rope_scaling_factor(plan.rope_scaling_factor),
+      rope_scaling_temperature(plan.rope_scaling_temperature),
+      rope_scaling_beta_fast(plan.rope_scaling_beta_fast),
+      rope_scaling_beta_slow(plan.rope_scaling_beta_slow),
+      max_concurrency(plan.max_concurrency),
+      prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
@@ -487,6 +492,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             : 0U;
     request.lifecycle = Lifecycle::Empty;
     sequence.retained = false;
+    // Residual-ring revalidation needs the retained bundle's key counts before the
+    // reuse branches reset them; a full reset passes retained 0 (every bit clears).
+    const std::uint32_t retained_text_valid    = sequence.text_kv_valid;
+    const std::uint32_t retained_backend_valid = backend_kv_valid(sequence);
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
@@ -553,6 +562,20 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
 
         trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
         bind_sequence_kv(sequence);
+        if (decoder->text_kv.residual_enabled()) {
+            // After any backward trim, a ring slot is exact only if its last written key
+            // survived inside the new recent window (slot rows written by trimmed-away
+            // keys hold rows the sequence will re-append later, not the older key the
+            // next fetch would name).
+            decoder->text_kv.revalidate_residual_ring(sequence.kv->text.bound_row(),
+                                                      retained_text_valid, base, device.stream);
+            if (qwen3_6::PagedKVCache* backend = backend_kv_cache();
+                backend != nullptr && backend->residual_enabled() && sequence.kv->backend) {
+                backend->revalidate_residual_ring(sequence.kv->backend->bound_row(),
+                                                  retained_backend_valid,
+                                                  backend_kv_valid(sequence), device.stream);
+            }
+        }
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
@@ -811,6 +834,21 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;
             sequence.tail_hidden_valid  = true;
+            if (committed < pending.produced && decoder->text_kv.residual_enabled()) {
+                // Rejected drafts wrote ring slots that older still-recent keys may name;
+                // those keys' exact rows were clobbered, so the slots fall back to the
+                // codec planes until their positions are re-appended.
+                decoder->text_kv.invalidate_residual_ring(
+                    sequence.kv->text.bound_row(), sequence.text_kv_valid,
+                    pending.base_E + pending.produced, device.stream);
+                if (qwen3_6::PagedKVCache* backend = backend_kv_cache();
+                    backend != nullptr && backend->residual_enabled() && sequence.kv->backend) {
+                    backend->invalidate_residual_ring(sequence.kv->backend->bound_row(),
+                                                      sequence.text_kv_valid,
+                                                      pending.base_E + pending.produced,
+                                                      device.stream);
+                }
+            }
 
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 sequence.mtp_kv_valid = sequence.execution_frontier;
@@ -1234,7 +1272,8 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head};
+                                       proposal_head,
+                                       rope_frequencies};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1497,7 +1536,8 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
     schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
                                          replay_records ? &*replay_records : nullptr, io,
-                                         prefill_hidden, prefill_chunk, proposal_head},
+                                         prefill_hidden, prefill_chunk, proposal_head,
+                                         rope_frequencies},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts, lane_tensor,
@@ -1528,7 +1568,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, rope_frequencies},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1786,7 +1826,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, rope_frequencies},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -1917,7 +1957,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
-                                                  prefill_hidden, prefill_chunk, proposal_head},
+                                                  prefill_hidden, prefill_chunk, proposal_head,
+                                                  rope_frequencies},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -2079,7 +2120,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head},
+                                                     proposal_head, rope_frequencies},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,
@@ -2214,6 +2255,20 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         if (kv_dtype == DType::U8) { return KvCacheStorage::HqE8Rice2B; }
         return KvCacheStorage::Int8Group64;
     }();
+    out.rope_scaling_factor      = rope_scaling_factor;
+    out.rope_scaling_temperature = rope_scaling_temperature;
+    out.rope_scaling_beta_fast   = rope_scaling_beta_fast;
+    out.rope_scaling_beta_slow   = rope_scaling_beta_slow;
+    if (rope_scaling_factor > 1.0F) {
+        if (capacity <= TextConfig::original_positions) {
+            out.rope_note =
+                "rope scaling is active below the checkpoint's native position range; this "
+                "costs short-prompt quality";
+        }
+    } else if (capacity > TextConfig::original_positions) {
+        out.rope_note =
+            "max-context exceeds the checkpoint's trained positions without rope scaling";
+    }
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

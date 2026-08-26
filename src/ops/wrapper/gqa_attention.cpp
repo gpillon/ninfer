@@ -27,6 +27,8 @@ constexpr std::int32_t kMaximumVerifyTokens          = 16;
 constexpr std::int32_t kMaximumBatchSize             = 8;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
+constexpr std::int32_t kHqResidualRows =
+    static_cast<std::int32_t>(kGqaHqSinkKeys + kGqaHqRecentKeys);
 
 std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
     if (q_heads == 24) { return 4; }
@@ -56,6 +58,32 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
     }
 }
 
+// The U8 residual window arrives as all-or-none: exact rotated-frame bf16 side planes
+// [head_dim, kv_heads, sink+recent rows, slots] plus U32 ring-validity words [4, slots].
+// Any other cache dtype must not carry them.
+void validate_residual(const Tensor& residual_k, const Tensor& residual_v,
+                       const Tensor& ring_valid, DType dtype, std::int32_t kv_heads,
+                       std::int32_t slots, const char* op) {
+    const bool present =
+        residual_k.data != nullptr || residual_v.data != nullptr || ring_valid.data != nullptr;
+    if (!present) { return; }
+    if (dtype != DType::U8) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": residual planes are an hq-e8-2b-only feature");
+    }
+    if (residual_k.dtype != DType::BF16 || residual_v.dtype != DType::BF16 ||
+        ring_valid.dtype != DType::I32) {
+        throw std::invalid_argument(std::string(op) + ": invalid residual plane dtypes");
+    }
+    require_shape(residual_k, kHeadDim, kv_heads, kHqResidualRows, slots, op, "residual k plane");
+    require_shape(residual_v, kHeadDim, kv_heads, kHqResidualRows, slots, op, "residual v plane");
+    require_shape(ring_valid, static_cast<std::int32_t>(kGqaHqRecentKeys / 32), slots, 1, 1, op,
+                  "residual ring validity");
+    require_contiguous_nonnull(residual_k, op, "residual k plane");
+    require_contiguous_nonnull(residual_v, op, "residual v plane");
+    require_contiguous_nonnull(ring_valid, op, "residual ring validity");
+}
+
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
     if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 && cache.dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
@@ -70,6 +98,8 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     if (cache.dtype == DType::U8 && cache.quant_group != kHqQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": hq-e8-2b KV cache must use quant_group 32");
     }
+    validate_residual(cache.residual_k, cache.residual_v, cache.ring_valid, cache.dtype, kv_heads,
+                      1, op);
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_table.ne[0];
@@ -149,6 +179,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_tables.ne[0];
     const std::int32_t table_rows     = cache.block_tables.ne[1];
+    validate_residual(cache.residual_k, cache.residual_v, cache.ring_valid, cache.dtype, kv_heads,
+                      table_rows, op);
     const std::int64_t capacity       = static_cast<std::int64_t>(logical_pages) * kPagedKVPageSize;
     if (physical_pages <= 0 || logical_pages <= 0 || table_rows <= 0 ||
         capacity > std::numeric_limits<std::int32_t>::max()) {
@@ -206,11 +238,18 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     return static_cast<std::uint32_t>(capacity);
 }
 
+// U8 (hq-e8-2b) reaches the absolute envelope ceiling; the paged BF16/I8 decode kernels
+// stage a fixed number of page ids per split, so their linear envelopes stay capped.
+std::uint32_t maximum_visible_keys_for(DType cache_dtype) {
+    return cache_dtype == DType::U8 ? kGqaAttentionMaximumVisibleKeys
+                                    : kGqaAttentionMaximumLinearVisibleKeys;
+}
+
 void validate_envelope(GqaExecutionEnvelope envelope, const PagedKVLayerView& cache,
                        std::int32_t tokens, const char* op) {
     const std::uint32_t capacity = validate_cache(cache, cache.num_kv_heads, op);
     if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > maximum_visible_keys_for(cache.dtype) ||
         envelope.max_visible_keys > capacity) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope");
     }
@@ -287,7 +326,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
     if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > maximum_visible_keys_for(cache.dtype) ||
         envelope.max_visible_keys > capacity ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(width)) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope or table");
@@ -299,6 +338,27 @@ struct SmallTWorkspace {
     Tensor m;
     Tensor l;
 };
+
+// U8 prompt scratch: banded when the envelope exceeds one band. Returns the scratch span and
+// fills the carry tensors (empty for the single-band and non-U8 cases).
+std::uint32_t allocate_hq_prompt_scratch(WorkspaceArena& workspace, std::int32_t kv_heads,
+                                         std::int32_t q_heads, std::int32_t width,
+                                         GqaExecutionEnvelope envelope, bool u8, Tensor& scratch_k,
+                                         Tensor& scratch_v, Tensor& carry_acc, Tensor& carry_m,
+                                         Tensor& carry_l) {
+    if (!u8) { return envelope.max_visible_keys; }
+    const std::uint32_t span =
+        std::min(envelope.max_visible_keys, kGqaHqPromptScratchBandKeys);
+    const auto rows = static_cast<std::int32_t>(span);
+    scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, rows, 1});
+    scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, rows, 1});
+    if (span < envelope.max_visible_keys) {
+        carry_acc = workspace.alloc(DType::BF16, {kHeadDim, q_heads, width, 1});
+        carry_m   = workspace.alloc(DType::FP32, {q_heads, width, 1, 1});
+        carry_l   = workspace.alloc(DType::FP32, {q_heads, width, 1, 1});
+    }
+    return span;
+}
 
 template <class Allocator>
 SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_heads,
@@ -401,7 +461,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > maximum_visible_keys_for(cache_dtype) ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(max_width)) {
         throw std::invalid_argument("gqa_attention workspace: invalid profile or interval");
     }
@@ -445,9 +505,16 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         }
         if (routes_prompt) {
             const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-            const std::size_t scratch   = 2 * static_cast<std::size_t>(envelope.max_visible_keys) *
-                                        static_cast<std::size_t>(kv_heads) * kHeadDim *
-                                        sizeof(std::uint16_t);
+            const std::size_t span      = std::min(envelope.max_visible_keys,
+                                                  kGqaHqPromptScratchBandKeys);
+            std::size_t scratch         = 2 * span * static_cast<std::size_t>(kv_heads) *
+                                  kHeadDim * sizeof(std::uint16_t);
+            if (span < envelope.max_visible_keys) {
+                // The banded carry state (acc [head_dim, q_heads, width] bf16 + m/l fp32) is
+                // live alongside the scratch inside one prompt call - size the sum.
+                scratch += (2ULL * kHeadDim + 8) * static_cast<std::size_t>(q_heads) *
+                           static_cast<std::size_t>(max_width);
+            }
             maximum = std::max(maximum, scratch);
         }
     }
@@ -492,13 +559,15 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     }
     Tensor scratch_k;
     Tensor scratch_v;
-    if (cache.dtype == DType::U8) {
-        const auto span = static_cast<std::int32_t>(envelope.max_visible_keys);
-        scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, span, 1});
-        scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, span, 1});
-    }
+    Tensor carry_acc;
+    Tensor carry_m;
+    Tensor carry_l;
+    (void)allocate_hq_prompt_scratch(workspace, kv_heads, q.ne[1], q.ne[2], envelope,
+                                     cache.dtype == DType::U8, scratch_k, scratch_v, carry_acc,
+                                     carry_m, carry_l);
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, scratch_k, scratch_v, out, stream);
+                                        cache, scratch_k, scratch_v, carry_acc, carry_m, carry_l,
+                                        envelope.max_visible_keys, out, stream);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -549,13 +618,15 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     }
     Tensor scratch_k;
     Tensor scratch_v;
-    if (cache.dtype == DType::U8) {
-        const auto span = static_cast<std::int32_t>(envelope.max_visible_keys);
-        scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, cache.num_kv_heads, span, 1});
-        scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, cache.num_kv_heads, span, 1});
-    }
+    Tensor carry_acc;
+    Tensor carry_m;
+    Tensor carry_l;
+    (void)allocate_hq_prompt_scratch(workspace, cache.num_kv_heads, q.ne[1], q.ne[2], envelope,
+                                     cache.dtype == DType::U8, scratch_k, scratch_v, carry_acc,
+                                     carry_m, carry_l);
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, scratch_k, scratch_v,
-                                                  out, stream);
+                                                  carry_acc, carry_m, carry_l,
+                                                  envelope.max_visible_keys, out, stream);
 }
 
 } // namespace ninfer::ops
