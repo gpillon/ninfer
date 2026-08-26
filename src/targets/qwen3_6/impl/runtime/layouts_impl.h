@@ -234,6 +234,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
+    // plan.capacity is the PER-SEQUENCE context ceiling (options.max_context); the shared
+    // pool token count is plan.kv_capacity. The attention workspace envelope follows the
+    // per-sequence bound - one attention invocation never sees more than one sequence's
+    // window - so pool-sized reservations must not derive from it.
     const ops::GqaExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -636,7 +640,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
+            // Instantiation memory grows with the captured split grids: the
+            // 128k envelope fits the flat 12 MiB bound, the 262k envelope
+            // measures ~26 MiB per batch.
+            const std::size_t per_batch =
+                impl->capacity <= 131072 ? 12ULL * kMiB : 48ULL * kMiB;
+            impl->graph_allowance_bytes = checked_mul(per_batch, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
@@ -688,6 +697,23 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile) {
     validate_target_options(device, options);
 
+    const auto kv_storage_dtype = [](KvCacheStorage storage) {
+        switch (storage) {
+        case KvCacheStorage::BFloat16: return DType::BF16;
+        case KvCacheStorage::Int8Group64: return DType::I8;
+        case KvCacheStorage::HqE8Rice2B: return DType::U8;
+        }
+        throw std::logic_error("unreachable KvCacheStorage");
+    };
+    const auto kv_storage_group = [](KvCacheStorage storage) {
+        switch (storage) {
+        case KvCacheStorage::BFloat16: return 0;
+        case KvCacheStorage::Int8Group64: return qwen3_6::kKvQuantGroup;
+        case KvCacheStorage::HqE8Rice2B: return qwen3_6::kKvHqQuantGroup;
+        }
+        throw std::logic_error("unreachable KvCacheStorage");
+    };
+
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
@@ -695,8 +721,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
+        .kv_dtype       = kv_storage_dtype(options.kv_cache),
+        .kv_quant_group = kv_storage_group(options.kv_cache),
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,
