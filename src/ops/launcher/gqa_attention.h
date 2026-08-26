@@ -58,12 +58,23 @@ void gqa_small_t_partial_hq(const Tensor& q, CacheInput input, const Tensor& pos
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_attention_bf16(const Tensor& q, const Tensor& positions, float scale,
                                 const CacheView& cache, Metadata metadata, Tensor& out,
+                                const Tensor& partial_acc, const Tensor& partial_m,
+                                const Tensor& partial_l, std::int32_t split_count,
                                 cudaStream_t stream);
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_attention_i8(const Tensor& q, const Tensor& positions, float scale,
                               const CacheView& cache, Metadata metadata, Tensor& out,
+                              const Tensor& partial_acc, const Tensor& partial_m,
+                              const Tensor& partial_l, std::int32_t split_count,
                               cudaStream_t stream);
+
+// Key-split policy for the INT8 prompt kernel (ROADMAP WI-K1a): splitting the key range into S
+// segments multiplies the (q_block, head) item count without extra KV traffic; per-segment
+// online-softmax partials are merged by gqa_attention_prefill_reduce_kernel. S minimizes the
+// wave-fill model ceil(items*S/#SMs)/S over S in {1..4} and stays at 1 unless that predicts a
+// >=10% attention-time reduction; S=1 keeps the single-pass path bit-identical.
+std::int32_t gqa_prefill_split_count(std::int32_t width, std::int32_t q_heads);
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float scale,
@@ -71,7 +82,9 @@ void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float sc
                               const Tensor& new_v, const Tensor& scratch_k,
                               const Tensor& scratch_v, const Tensor& carry_acc,
                               const Tensor& carry_m, const Tensor& carry_l,
-                              std::uint32_t visible_keys, Tensor& out, cudaStream_t stream);
+                              std::uint32_t visible_keys, const Tensor& partial_acc,
+                              const Tensor& partial_m, const Tensor& partial_l,
+                              std::int32_t split_count, Tensor& out, cudaStream_t stream);
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_append_bf16(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -95,13 +108,14 @@ const char* gqa_attention_route_name(GqaAttentionRoute route);
 
 void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& positions, const Tensor& valid_columns,
-                                  const Tensor& table_rows, float scale,
+                                  const Tensor& table_rows, const Tensor& gate, float scale,
                                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                                   std::int32_t column_begin, std::int32_t width,
                                   Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                                   Tensor& out, cudaStream_t stream);
 
-void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
+void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions,
+                                         const Tensor& gate, float scale,
                                          const PagedKVLayerView& cache,
                                          GqaExecutionEnvelope envelope, Tensor& partial_acc,
                                          Tensor& partial_m, Tensor& partial_l, Tensor& out,
@@ -112,7 +126,9 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                                  const Tensor& scratch_k, const Tensor& scratch_v,
                                  const Tensor& carry_acc, const Tensor& carry_m,
-                                 const Tensor& carry_l, std::uint32_t visible_keys, Tensor& out,
+                                 const Tensor& carry_l, std::uint32_t visible_keys,
+                                 const Tensor& partial_acc, const Tensor& partial_m,
+                                 const Tensor& partial_l, std::int32_t split_count, Tensor& out,
                                  cudaStream_t stream);
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -125,7 +141,9 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            const PagedKVLayerView& cache, const Tensor& scratch_k,
                                            const Tensor& scratch_v, const Tensor& carry_acc,
                                            const Tensor& carry_m, const Tensor& carry_l,
-                                           std::uint32_t visible_keys, Tensor& out,
-                                           cudaStream_t stream);
+                                           std::uint32_t visible_keys,
+                                           const Tensor& partial_acc, const Tensor& partial_m,
+                                           const Tensor& partial_l, std::int32_t split_count,
+                                           Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail
