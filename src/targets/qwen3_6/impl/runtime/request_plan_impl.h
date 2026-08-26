@@ -188,7 +188,8 @@ void ProgramImplCore::apply_reuse_decision(RequestPlanImpl& plan, const Resident
         return;
     }
     const bool dflash_append_ready =
-        speculative_backend != SpeculativeBackend::DFlash ||
+        (speculative_backend != SpeculativeBackend::DFlash &&
+         speculative_backend != SpeculativeBackend::DFlash2) ||
         view.dflash_context_frontier == view.execution_frontier;
     if (view.execution_frontier != 0 && dflash_append_ready &&
         qwen3_6::detail::prefix_matches(prompt, *view.ledger, *view.identity,
@@ -222,6 +223,17 @@ void ProgramImplCore::apply_reuse_decision(RequestPlanImpl& plan, const Resident
         (!dflash ||
          !qwen3_6::detail::dflash_rewrite_checkpoint_ready(
              view.backend_image_present, view.dflash_context_frontier, plan.reuse_base))) {
+        plan.reuse      = ReusePath::FullReset;
+        plan.reuse_base = 0;
+    }
+
+    // DFlash2 claims no paged backend KV at all (see the entitlement above), so the v1 readiness
+    // predicate -- which requires a backend image -- cannot be reused here. The drafter's own
+    // cyclic SWA context is what the checkpoint restore depends on, and it is vouched for by the
+    // shared dflash_context_frontier scalar.
+    if (is_rewrite_checkpoint_restore(plan.reuse) &&
+        speculative_backend == SpeculativeBackend::DFlash2 &&
+        (!dflash2 || view.dflash_context_frontier < plan.reuse_base)) {
         plan.reuse      = ReusePath::FullReset;
         plan.reuse_base = 0;
     }

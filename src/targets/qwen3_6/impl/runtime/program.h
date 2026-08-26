@@ -12,6 +12,7 @@
 #include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
+#include "targets/qwen3_6/impl/runtime/dflash2_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/mtp_adaptive.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -339,6 +340,7 @@ public:
         mtp_replay_records;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
+    std::optional<DFlash2PersistentState> dflash2;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     Tensor sampling_config;
@@ -390,6 +392,9 @@ private:
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
+    void enqueue_dflash2_context_append(std::span<const std::uint32_t> lanes,
+                                        std::span<const std::uint32_t> starts,
+                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
     [[nodiscard]] runtime::BatchedGeneratedRound
@@ -401,6 +406,9 @@ private:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_dflash2_batch(std::span<const std::uint32_t> lanes,
+                         std::span<const runtime::RoundBudget> budgets);
     void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
                              std::uint32_t backend_pages);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
