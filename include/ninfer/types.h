@@ -497,6 +497,13 @@ struct RuntimeStats {
     std::uint64_t kv_ram_drops          = 0;
     double kv_ram_save_seconds          = 0;
     double kv_ram_load_seconds          = 0;
+    // Measurement-only (does not affect admission or reuse decisions): how much leading-token
+    // prefix an admitted request shares with other requests still sitting in the pending queue
+    // at admission time -- i.e. real concurrent-sibling overlap, sampled once per admission
+    // whenever the overlap reaches a small noise floor.
+    std::uint64_t sibling_prefix_samples             = 0;
+    std::uint64_t sibling_prefix_common_tokens_sum    = 0;
+    std::uint64_t sibling_prefix_common_tokens_max    = 0;
 };
 
 struct LoadSummary {

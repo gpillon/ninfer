@@ -546,6 +546,13 @@ std::string format_throughput(const ThroughputReport& report) {
                                   report.scheduler.kv_ram_evictions, report.scheduler.kv_ram_drops,
                                   report.kv_ram_save_seconds, report.kv_ram_load_seconds);
     }
+    if (report.scheduler.sibling_prefix_samples != 0) {
+        const double average = static_cast<double>(report.scheduler.sibling_prefix_common_tokens_sum) /
+                               static_cast<double>(report.scheduler.sibling_prefix_samples);
+        out << " sibling-prefix samples=" << report.scheduler.sibling_prefix_samples
+            << " avg=" << std::setprecision(0) << average
+            << " max=" << report.scheduler.sibling_prefix_common_tokens_max;
+    }
     return out.str();
 }
 

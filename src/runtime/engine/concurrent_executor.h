@@ -8,6 +8,7 @@
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
+#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/prepared_prompt.h"
 
 #include <algorithm>
 #include <array>
@@ -1019,6 +1020,36 @@ private:
         }
     }
 
+    // Measurement-only: records how much leading-token prefix `admitted` shares with the other
+    // still-pending requests in `queued`, into cumulative_stats_.sibling_prefix_*. Never changes
+    // admission or reuse behavior -- purely observational, so real production traces can show the
+    // actual common-prefix distribution across concurrent-sibling bursts before any reuse
+    // mechanism is built on top of it.
+    void record_sibling_prefix_sample(const Request& admitted,
+                                      const std::vector<std::shared_ptr<Request>>& queued) {
+        constexpr std::size_t kNoiseFloorTokens = 64;
+        const targets::qwen3_6::PreparedPromptData& admitted_data =
+            targets::qwen3_6::PreparedPromptAccess::view(admitted.prompt);
+        std::size_t best = 0;
+        for (const std::shared_ptr<Request>& other : queued) {
+            if (other->id == admitted.id) { continue; }
+            const targets::qwen3_6::PreparedPromptData& other_data =
+                targets::qwen3_6::PreparedPromptAccess::view(other->prompt);
+            const auto [mismatch_a, mismatch_b] =
+                std::mismatch(admitted_data.token_ids.begin(), admitted_data.token_ids.end(),
+                             other_data.token_ids.begin(), other_data.token_ids.end());
+            const std::size_t common =
+                static_cast<std::size_t>(mismatch_a - admitted_data.token_ids.begin());
+            best = std::max(best, common);
+        }
+        if (best < kNoiseFloorTokens) { return; }
+        ++cumulative_stats_.sibling_prefix_samples;
+        cumulative_stats_.sibling_prefix_common_tokens_sum += best;
+        cumulative_stats_.sibling_prefix_common_tokens_max =
+            std::max(cumulative_stats_.sibling_prefix_common_tokens_max,
+                     static_cast<std::uint64_t>(best));
+    }
+
     AdmissionProgress try_admit_one() {
         bool control_progress = false;
         for (;;) {
@@ -1074,6 +1105,7 @@ private:
                 continue;
             }
             if (head_lane) {
+                record_sibling_prefix_sample(*head, queued);
                 return admit_planned_request(head, *head_lane, BackfillClass::None, 0);
             }
 
@@ -1155,6 +1187,7 @@ private:
                     backfill = BackfillClass::Temporal;
                 }
                 if (backfill != BackfillClass::None) {
+                    record_sibling_prefix_sample(*candidate, queued);
                     return admit_planned_request(candidate, *candidate_lane, backfill,
                                                  protection_->epoch_id);
                 }
