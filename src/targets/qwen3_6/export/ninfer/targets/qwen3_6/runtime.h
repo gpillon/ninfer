@@ -178,7 +178,7 @@ public:
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
-    [[nodiscard]] std::uint32_t retained_frontier_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
     void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,

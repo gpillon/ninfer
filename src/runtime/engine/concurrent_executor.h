@@ -757,6 +757,7 @@ private:
 
         auto first_ram_lane = [&](bool after_eviction) -> std::optional<std::uint32_t> {
             std::optional<std::uint32_t> dirty;
+            std::uint64_t dirty_tick = 0;
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                 if (slots_[lane] != nullptr) { continue; }
                 const bool feasible =
@@ -765,7 +766,11 @@ private:
                         : instance_.program->can_admit_lane(lane, *ram_plan);
                 if (!feasible) { continue; }
                 if (!instance_.program->has_retained_lane(lane)) { return lane; }
-                if (!dirty) { dirty = lane; }
+                const std::uint64_t tick = instance_.program->retained_use_tick(lane);
+                if (!dirty || tick < dirty_tick) {
+                    dirty      = lane;
+                    dirty_tick = tick;
+                }
             }
             return dirty;
         };
@@ -776,7 +781,15 @@ private:
         auto consider_vram           = [&](std::uint32_t lane, std::uint32_t reuse, bool evict) {
             const bool dirty = instance_.program->has_retained_lane(lane);
             if (selected && reuse < selected_reuse) { return; }
-            if (selected && reuse == selected_reuse && (!selected_dirty || dirty)) { return; }
+            if (selected && reuse == selected_reuse) {
+                if (!selected_dirty) { return; }
+                if (dirty) {
+                    const std::uint64_t selected_tick =
+                        instance_.program->retained_use_tick(selected->lane);
+                    const std::uint64_t tick = instance_.program->retained_use_tick(lane);
+                    if (tick >= selected_tick) { return; }
+                }
+            }
             selected       = LaneChoice{.lane = lane, .evict_retained = evict, .ram_entry_id = 0};
             selected_reuse = reuse;
             selected_dirty = dirty;
@@ -885,19 +898,28 @@ private:
 
         try {
             if (choice.evict_retained) {
-                for (std::uint32_t retained_lane = 0;
-                     retained_lane < max_concurrency_ &&
-                     !instance_.program->can_admit_lane(lane, winning_plan);
-                     ++retained_lane) {
-                    if (retained_lane != lane && slots_[retained_lane] == nullptr &&
-                        instance_.program->has_retained_lane(retained_lane)) {
-                        (void)instance_.program->capture_retained_lane(retained_lane);
-                        instance_.program->evict_retained_lane(retained_lane);
-                        invalidate_lane_plans(retained_lane);
+                while (!instance_.program->can_admit_lane(lane, winning_plan)) {
+                    std::optional<std::uint32_t> victim;
+                    std::uint64_t victim_tick = 0;
+                    for (std::uint32_t retained_lane = 0; retained_lane < max_concurrency_;
+                         ++retained_lane) {
+                        if (retained_lane == lane || slots_[retained_lane] != nullptr ||
+                            !instance_.program->has_retained_lane(retained_lane)) {
+                            continue;
+                        }
+                        const std::uint64_t tick =
+                            instance_.program->retained_use_tick(retained_lane);
+                        if (!victim || tick < victim_tick) {
+                            victim      = retained_lane;
+                            victim_tick = tick;
+                        }
                     }
-                }
-                if (!instance_.program->can_admit_lane(lane, winning_plan)) {
-                    throw std::logic_error("retained eviction did not make admission feasible");
+                    if (!victim) {
+                        throw std::logic_error("retained eviction did not make admission feasible");
+                    }
+                    (void)instance_.program->capture_retained_lane(*victim);
+                    instance_.program->evict_retained_lane(*victim);
+                    invalidate_lane_plans(*victim);
                 }
             }
 

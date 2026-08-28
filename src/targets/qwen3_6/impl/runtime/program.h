@@ -172,6 +172,7 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool retained                 = false;
+    std::uint64_t use_tick        = 0;
     RewriteCheckpoint rewrite_checkpoint;
 };
 
@@ -238,7 +239,7 @@ public:
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
-    [[nodiscard]] std::uint32_t retained_frontier_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
     void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
@@ -312,6 +313,7 @@ public:
 
     std::size_t workspace_logical_peak_bytes = 0;
     std::optional<qwen3_6::detail::KVRamCache> kv_ram_cache_;
+    std::uint64_t next_use_tick_ = 1;
 
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;

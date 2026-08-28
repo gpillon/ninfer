@@ -735,7 +735,11 @@ limit 和 output state 始终由新 request 创建。
 Retained state 占用实际 state-pool memory，但不占 active control slot，也不保留 future growth
 reservation。Active admission 优先；cache occupancy 阻塞原本可行的 request 前，先驱逐 free lanes 上的
 retained entries。VRAM retained physical state 仍留在原 lane，Planner 在 free lanes 中选择最大合法
-reuse，不在 GPU 上复制或迁移 page mapping。An optional host-RAM second tier snapshots a completed
+reuse，不在 GPU 上复制或迁移 page mapping。Equal reuse prefers a free lane with no retained
+bundle; among equal-reuse dirty free lanes it covers the least-recently-admitted retained chat
+(monotonic occupy tick assigned after the first non-throwing `advance_prefill` in
+`start_prefill_lane`), then lowest lane index. An
+optional host-RAM second tier snapshots a completed
 bundle into pinned host memory at the admission site that is about to destroy it. A later hit
 restores the full SequenceState onto the chosen free lane and then uses the same prefix-reuse
 decision. Cache ownership is claimed only after the slot/lane and the full entitlement are already
@@ -755,6 +759,12 @@ The host tier is an exclusive FIFO of chats that are not on a VRAM lane. A new c
 the tail. Capacity pressure evicts the oldest unpinned host entry until the new image fits; if it
 still cannot, `drops` increments and the incoming request proceeds while the VRAM bundle is
 released. Host RAM is not a precondition for admission.
+
+Capture and retained-lane eviction run only after `find_admission_lane` has already selected a
+free lane for that request. A queued prompt that still cannot fit — because in-flight lanes occupy
+enough shared pool pages that no free lane is feasible even after reclaiming every other free
+retained bundle — waits and does not dump any GPU lane. A later smaller backfill candidate that
+can fit may still admit and may capture other free retained lanes for itself.
 
 The executor captures at each admission site that is about to destroy a retained bundle, not inside
 `clear_lane` / `evict_retained_lane` / abort / destructor:
@@ -777,10 +787,13 @@ blocks that still occupy the pin until reap. A later capture may still reap or e
 
 The planner picks the larger `reusable_prompt_tokens` between VRAM and RAM; equal reuse keeps
 VRAM. VRAM `FullReset` and RAM restore both prefer a free lane with no retained bundle and cover a
-dirty lane only when no empty lane is feasible. The admitted `RequestPlan` is the winner: RAM pass
-1 keeps `evict_retained=false` even if the target lane is dirty, and restore captures that lane's
-old bundle. `GenerationResult` uses `prefix_reuse_source` for `none` / `vram_resident` /
-`host_ram`; `prefix_reuse_path` still describes only frontier/checkpoint semantics.
+dirty lane only when no empty lane is feasible. Among those equal-reuse dirty lanes, the victim is
+the least-recently-admitted retained bundle, then lowest lane index. Page-reclaim eviction of
+other free retained lanes uses the same recency order and never captures the selected lane twice.
+The admitted `RequestPlan` is the winner: RAM pass 1 keeps `evict_retained=false` even if the
+target lane is dirty, and restore captures that lane's old bundle. `GenerationResult` uses
+`prefix_reuse_source` for `none` / `vram_resident` / `host_ram`; `prefix_reuse_path` still describes
+only frontier/checkpoint semantics.
 
 ---
 

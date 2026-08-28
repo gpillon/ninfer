@@ -683,7 +683,6 @@ int exercise_c2_keeps_first_vram(const char* artifact) {
         return fail("C=2 sequential second chat captured the first retained lane instead of the empty lane");
     }
     const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
-    const std::vector<ninfer::TokenId> history_b = resume_prefix(tokens_c(), second.generated_token_ids);
     const auto restores_before                   = engine.runtime_stats().kv_ram_restores;
     const ninfer::GenerationResult exact_a =
         engine.generate(engine.prepare_tokens(history_a), greedy(2, true));
@@ -699,6 +698,31 @@ int exercise_c2_keeps_first_vram(const char* artifact) {
                   << static_cast<int>(exact_a.prefix_reuse_source) << '\n';
         return 1;
     }
+    return 0;
+}
+
+int exercise_c2_continue_refreshes_recency(const char* artifact) {
+    ninfer::Engine engine(ordinary_options(artifact, 2, 4096, kRamHitBytes));
+    if (const int rc = verify_ram_tier(engine, kRamHitBytes); rc != 0) { return rc; }
+    const auto keep_a = tokens_a();
+    const ninfer::GenerationResult first_a =
+        engine.generate(engine.prepare_tokens(keep_a), greedy(4, false));
+    const ninfer::GenerationResult first_b =
+        engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
+    if (first_a.generated_token_ids.size() != 4 || first_b.generated_token_ids.size() != 4 ||
+        engine.runtime_stats().kv_ram_captures != 0) {
+        return fail("C=2 continue-A setup did not keep A and B in VRAM");
+    }
+    const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_b =
+        resume_prefix(tokens_c(), first_b.generated_token_ids);
+    const ninfer::GenerationResult exact_a =
+        engine.generate(engine.prepare_tokens(history_a), greedy(2, true));
+    if (const int rc = expect_exact_hit(exact_a, static_cast<std::uint32_t>(history_a.size()),
+                                        "C=2 continue-A exact resume");
+        rc != 0) {
+        return rc;
+    }
     const std::vector<ninfer::TokenId> continued_a =
         concat(resume_prefix(history_a, exact_a.generated_token_ids), {198, 198, 198, 198});
     const ninfer::GenerationResult hit =
@@ -706,32 +730,135 @@ int exercise_c2_keeps_first_vram(const char* artifact) {
     if (const int rc = expect_suffix_hit(
             hit, ninfer::PrefixReuseSource::VramResident,
             static_cast<std::uint32_t>(continued_a.size() - 4),
-            static_cast<std::uint32_t>(continued_a.size()), "C=2 sequential first-chat message");
+            static_cast<std::uint32_t>(continued_a.size()), "C=2 continue-A new message");
         rc != 0) {
         return rc;
-    }
-    if (engine.runtime_stats().kv_ram_restores != restores_before ||
-        engine.runtime_stats().running_requests != 0) {
-        std::cerr << "C=2 sequential first-chat message restored from RAM: restores="
-                  << engine.runtime_stats().kv_ram_restores << '\n';
-        return 1;
-    }
-    const ninfer::GenerationResult resident_b =
-        engine.generate(engine.prepare_tokens(history_b), greedy(2, true));
-    if (resident_b.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident ||
-        resident_b.reused_prompt_tokens != history_b.size() ||
-        engine.runtime_stats().kv_ram_restores != restores_before) {
-        std::cerr << "C=2 sequential second chat was not still VRAM: source="
-                  << static_cast<int>(resident_b.prefix_reuse_source)
-                  << " reused=" << resident_b.reused_prompt_tokens << '\n';
-        return 1;
     }
     const auto captures_before_third = engine.runtime_stats().kv_ram_captures;
     const ninfer::GenerationResult third =
         engine.generate(engine.prepare_tokens(tokens_e()), greedy(2, false));
     if (third.prefix_reuse_path != ninfer::PrefixReusePath::FullReset ||
         engine.runtime_stats().kv_ram_captures != captures_before_third + 1) {
-        return fail("C=2 sequential third chat did not cover one dirty lane");
+        return fail("C=2 continue-A third chat did not cover one dirty lane");
+    }
+    const std::vector<ninfer::TokenId> after_a =
+        resume_prefix(continued_a, hit.generated_token_ids);
+    const ninfer::GenerationResult still_a =
+        engine.generate(engine.prepare_tokens(after_a), greedy(2, true));
+    if (still_a.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident) {
+        std::cerr << "C=2 continue-A spilled the MRU chat: source="
+                  << static_cast<int>(still_a.prefix_reuse_source) << '\n';
+        return 1;
+    }
+    const auto restores_before_b = engine.runtime_stats().kv_ram_restores;
+    const ninfer::GenerationResult ram_b =
+        engine.generate(engine.prepare_tokens(history_b), greedy(2, true));
+    if (const int rc = expect_ram_hit(ram_b, static_cast<std::uint32_t>(history_b.size()),
+                                      "C=2 continue-A spilled older B");
+        rc != 0) {
+        return rc;
+    }
+    if (engine.runtime_stats().kv_ram_restores != restores_before_b + 1) {
+        return fail("C=2 continue-A third chat did not capture the older B lane");
+    }
+    return 0;
+}
+
+int exercise_c2_lru_covers_oldest(const char* artifact) {
+    ninfer::Engine engine(ordinary_options(artifact, 2, 4096, kRamHitBytes));
+    if (const int rc = verify_ram_tier(engine, kRamHitBytes); rc != 0) { return rc; }
+    const auto keep_a = tokens_a();
+    const ninfer::GenerationResult first_a =
+        engine.generate(engine.prepare_tokens(keep_a), greedy(4, false));
+    const ninfer::GenerationResult first_b =
+        engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
+    if (first_a.generated_token_ids.size() != 4 || first_b.generated_token_ids.size() != 4 ||
+        engine.runtime_stats().kv_ram_captures != 0) {
+        return fail("C=2 LRU oldest setup did not keep A and B in VRAM");
+    }
+    const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_b =
+        resume_prefix(tokens_c(), first_b.generated_token_ids);
+    const auto captures_before = engine.runtime_stats().kv_ram_captures;
+    const ninfer::GenerationResult third =
+        engine.generate(engine.prepare_tokens(tokens_e()), greedy(2, false));
+    if (third.prefix_reuse_path != ninfer::PrefixReusePath::FullReset ||
+        engine.runtime_stats().kv_ram_captures != captures_before + 1) {
+        return fail("C=2 LRU oldest third chat did not cover one dirty lane");
+    }
+    const ninfer::GenerationResult still_b =
+        engine.generate(engine.prepare_tokens(history_b), greedy(2, true));
+    if (still_b.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident) {
+        std::cerr << "C=2 LRU oldest spilled newer B: source="
+                  << static_cast<int>(still_b.prefix_reuse_source) << '\n';
+        return 1;
+    }
+    const auto restores_before = engine.runtime_stats().kv_ram_restores;
+    const ninfer::GenerationResult ram_a =
+        engine.generate(engine.prepare_tokens(history_a), greedy(2, true));
+    if (const int rc =
+            expect_ram_hit(ram_a, static_cast<std::uint32_t>(history_a.size()), "C=2 LRU oldest A");
+        rc != 0) {
+        return rc;
+    }
+    if (engine.runtime_stats().kv_ram_restores != restores_before + 1) {
+        return fail("C=2 LRU oldest did not capture A");
+    }
+    return 0;
+}
+
+int exercise_c2_ram_covers_lru_dirty(const char* artifact) {
+    ninfer::Engine engine(ordinary_options(artifact, 2, 4096, kRamHitBytes));
+    if (const int rc = verify_ram_tier(engine, kRamHitBytes); rc != 0) { return rc; }
+    const auto keep_a = tokens_a();
+    const ninfer::GenerationResult first_a =
+        engine.generate(engine.prepare_tokens(keep_a), greedy(8, false));
+    if (first_a.generated_token_ids.size() != 8) {
+        return fail("C=2 RAM LRU source A did not complete");
+    }
+    const ninfer::GenerationResult first_b =
+        engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
+    const ninfer::GenerationResult first_d =
+        engine.generate(engine.prepare_tokens(tokens_d()), greedy(4, false));
+    if (first_b.generated_token_ids.size() != 4 || first_d.generated_token_ids.size() != 4 ||
+        engine.runtime_stats().kv_ram_captures == 0) {
+        return fail("C=2 RAM LRU did not spill A behind B and D");
+    }
+    const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_b =
+        resume_prefix(tokens_c(), first_b.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_d =
+        resume_prefix(tokens_d(), first_d.generated_token_ids);
+    const auto restores_before = engine.runtime_stats().kv_ram_restores;
+    const auto captures_before = engine.runtime_stats().kv_ram_captures;
+    const ninfer::GenerationResult ram_a =
+        engine.generate(engine.prepare_tokens(history_a), greedy(2, true));
+    if (const int rc = expect_ram_hit(ram_a, static_cast<std::uint32_t>(history_a.size()),
+                                      "C=2 RAM LRU restore A");
+        rc != 0) {
+        return rc;
+    }
+    if (engine.runtime_stats().kv_ram_restores != restores_before + 1 ||
+        engine.runtime_stats().kv_ram_captures != captures_before + 1) {
+        return fail("C=2 RAM LRU restore did not capture the dirty victim");
+    }
+    const ninfer::GenerationResult still_d =
+        engine.generate(engine.prepare_tokens(history_d), greedy(2, true));
+    if (still_d.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident) {
+        std::cerr << "C=2 RAM LRU spilled newer D: source="
+                  << static_cast<int>(still_d.prefix_reuse_source) << '\n';
+        return 1;
+    }
+    const auto restores_before_b = engine.runtime_stats().kv_ram_restores;
+    const ninfer::GenerationResult ram_b =
+        engine.generate(engine.prepare_tokens(history_b), greedy(2, true));
+    if (const int rc = expect_ram_hit(ram_b, static_cast<std::uint32_t>(history_b.size()),
+                                      "C=2 RAM LRU covered older B");
+        rc != 0) {
+        return rc;
+    }
+    if (engine.runtime_stats().kv_ram_restores != restores_before_b + 1) {
+        return fail("C=2 RAM LRU did not leave older B on the host");
     }
     return 0;
 }
@@ -1272,6 +1399,12 @@ int exercise_artifact(const char* artifact) {
     if (const int rc = exercise_queued_ram_hit(artifact); rc != 0) { return rc; }
     std::cerr << "ram_real: C=2 sequential empty lane keeps first chat in VRAM\n";
     if (const int rc = exercise_c2_keeps_first_vram(artifact); rc != 0) { return rc; }
+    std::cerr << "ram_real: C=2 continue A refreshes recency so C covers B\n";
+    if (const int rc = exercise_c2_continue_refreshes_recency(artifact); rc != 0) { return rc; }
+    std::cerr << "ram_real: C=2 LRU covers oldest dirty lane\n";
+    if (const int rc = exercise_c2_lru_covers_oldest(artifact); rc != 0) { return rc; }
+    std::cerr << "ram_real: C=2 RAM restore covers LRU dirty lane\n";
+    if (const int rc = exercise_c2_ram_covers_lru_dirty(artifact); rc != 0) { return rc; }
     std::cerr << "ram_real: C=3 sequential empty lane keeps first two chats in VRAM\n";
     if (const int rc = exercise_c3_keeps_empty_lane(artifact); rc != 0) { return rc; }
     std::cerr << "ram_real: site 3 / pass 1 / overlapping submit\n";

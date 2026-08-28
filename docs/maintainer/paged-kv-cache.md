@@ -810,12 +810,15 @@ The optional pinned-host tier is an exclusive FIFO of completed retained Sequenc
 that are not on a VRAM lane. Capture happens at the executor admission site that is about to
 destroy that bundle and appends a fresh D2H image at the FIFO tail. A capture that does not fit
 the host budget increments `drops` and the incoming request still proceeds. D2H completion is
-tracked with a per-entry CUDA event so the entry can be indexed before the copies drain. Restore
-writes the host image onto a new page mapping of the chosen free lane (an empty lane first; a
-dirty lane only when none is empty), records H2D completion on the same event, then start_prefill
-may overlap that copy on the CPU side. Consume erases the host entry wherever it sits in the FIFO
-and retires the block; capacity eviction destroys the oldest unpinned resident and waits for its
-copy event before freeing. Both then follow the same checkpoint decision as VRAM prefix reuse.
+tracked with a per-entry CUDA event so the entry can be indexed before the copies drain. Restore writes the host image onto a new page mapping of the chosen free lane (an empty lane
+first; a dirty lane only when none is empty, and among equal-reuse dirty lanes the
+least-recently-admitted retained bundle), records H2D completion on the same event, then
+start_prefill may overlap that copy on the CPU side. Capture and restore both require a selected
+free lane; a queued request that cannot admit does not dump in-flight or other retained GPU
+state. Consume erases the host entry wherever it sits
+in the FIFO and retires the block; capacity eviction destroys the oldest unpinned resident and
+waits for its copy event before freeing. Both then follow the same checkpoint decision as VRAM
+prefix reuse.
 Logged `used`/`entries` are live host residents only. The host image packs logical page `i`
 densely and neither stores nor sorts physical page IDs. A RAM hit still requires a complete
 SequenceState proof; active pages are not moved because of RAM capture/restore. Capacity is fixed

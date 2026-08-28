@@ -113,7 +113,9 @@ runs the real engine. The RAM-tier test covers capture sites 1–3, INT8 KV, MTP
 VRAM-wins-equal-reuse, longer-RAM-beats-shorter-VRAM, suffix prefill after RAM restore, RAM disabled, queued matcher,
 `allow_prefix_reuse=false`, rewrite-checkpoint restore, dirty-lane checkpoint restore, cancel-after-consume, consume-then-VRAM,
 overlapping `submit()` at `max_concurrency=2`, C=2/C=3 sequential FullReset onto an empty lane
-keeping earlier chats in VRAM (exact resume, new message, and a later dirty-lane cover), exclusive
+keeping earlier chats in VRAM, C=2 continue-A refreshing recency so a later FullReset covers the
+older dirty lane, C=2 FullReset covering the oldest dirty lane and RAM restore covering the LRU dirty
+lane, exclusive
 FIFO occupancy (RAM hit drops the restored chat from `used`/`entries`; later spill recaptures it),
 one-entry spill drop of a dirty-lane occupant, Engine teardown after a RAM restore,
 and the C=3 shared-pool analog (three 3-page chats, two 4-page continuations plus RAM suffix restore of the third, 2-page fits-now backfill, blocked 4-page tail, exact vs suffix reuse). `ninfer_admission_policy_test` locks the same 10-page leftover-2 / leftover-0 / no-lane arithmetic. `ninfer_kv_ram_cache_perf_test` and

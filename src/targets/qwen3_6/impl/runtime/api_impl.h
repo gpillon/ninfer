@@ -228,9 +228,11 @@ void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
 template <>
 bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
     return impl_->has_retained_lane(lane);
-}template <>
-std::uint32_t Program<Variant>::retained_frontier_lane(std::uint32_t lane) const noexcept {
-    return impl_->retained_frontier_lane(lane);
+}
+
+template <>
+std::uint64_t Program<Variant>::retained_use_tick(std::uint32_t lane) const noexcept {
+    return impl_->retained_use_tick(lane);
 }
 
 template <>
