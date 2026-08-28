@@ -896,6 +896,11 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency && sequences[lane].retained;
 }
 
+std::uint32_t ProgramImplCore::retained_frontier_lane(std::uint32_t lane) const noexcept {
+    if (!has_retained_lane(lane)) { return 0; }
+    return sequences[lane].execution_frontier;
+}
+
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
     clear_lane(sequences[lane], requests[lane]);

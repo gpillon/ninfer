@@ -703,7 +703,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     // ~304k visible keys after WI-2 banding. The 1M-envelope tier is a
                     // conservative extrapolation, not a measurement.
                     const std::uint64_t tier = final_visible <= 4096        ? 12ULL
-                                               : final_visible <= 262144    ? 82ULL
+                                               : final_visible <= 262144    ? 160ULL
                                                : final_visible <= 524288    ? 512ULL
                                                                              : 1024ULL;
                     return tier * kMiB;

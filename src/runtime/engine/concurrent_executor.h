@@ -720,32 +720,84 @@ private:
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
-        std::uint32_t selected_reuse = 0;
+        std::uint32_t selected_reuse             = 0;
+        bool selected_has_retained               = false;
+        std::uint32_t selected_retained_frontier = 0;
+        // Selection priority:
+        //
+        // 1. largest reusable prefix
+        // 2. on equal reuse, prefer a truly empty lane
+        // 3. if all candidates contain retained state, sacrifice the
+        //    smallest retained sequence first
+        //
+        // This protects long-lived agent contexts from unrelated short
+        // classifier/helper requests.
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-            if (instance_.program->can_admit_lane(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
-                selected       = LaneChoice{.lane = lane};
-                selected_reuse = reuse;
+            const bool has_retained =
+                instance_.program->has_retained_lane(lane);
+            const std::uint32_t retained_frontier =
+                has_retained
+                    ? instance_.program->retained_frontier_lane(lane)
+                    : 0;
+            const bool better =
+                !selected ||
+                reuse > selected_reuse ||
+                (reuse == selected_reuse &&
+                 selected_has_retained &&
+                 !has_retained) ||
+                (reuse == selected_reuse &&
+                 selected_has_retained &&
+                 has_retained &&
+                 retained_frontier < selected_retained_frontier);
+            if (instance_.program->can_admit_lane(lane, plan) && better) {
+                selected                    = LaneChoice{.lane = lane};
+                selected_reuse              = reuse;
+                selected_has_retained       = has_retained;
+                selected_retained_frontier  = retained_frontier;
             }
         }
         if (selected) { return selected; }
-
+        //
+        // No lane can admit directly. Retry allowing retained eviction.
+        //
+        selected.reset();
+        selected_reuse             = 0;
+        selected_has_retained      = false;
+        selected_retained_frontier = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            const bool has_retained =
+                instance_.program->has_retained_lane(lane);
+            const std::uint32_t retained_frontier =
+                has_retained
+                    ? instance_.program->retained_frontier_lane(lane)
+                    : 0;
+            const bool better =
+                !selected ||
+                reuse > selected_reuse ||
+                (reuse == selected_reuse &&
+                 selected_has_retained &&
+                 !has_retained) ||
+                (reuse == selected_reuse &&
+                 selected_has_retained &&
+                 has_retained &&
+                 retained_frontier < selected_retained_frontier);
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
+                better) {
                 selected = LaneChoice{
                     .lane           = lane,
                     .evict_retained = true,
                 };
-                selected_reuse = reuse;
+                selected_reuse             = reuse;
+                selected_has_retained      = has_retained;
+                selected_retained_frontier = retained_frontier;
             }
         }
         return selected;
