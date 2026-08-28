@@ -164,6 +164,13 @@ private:
         bool copies_timed              = false;
         cudaEvent_t copies_start       = nullptr;
         cudaEvent_t copies_done        = nullptr;
+        // Lineage identity (hash of the leading tokens, typically the system prompt + tool
+        // schema) and whether that lineage has previously produced a cache hit. Entries whose
+        // lineage has demonstrated reuse are evicted only after all non-protected entries are
+        // exhausted, so short one-shot captures (classifier calls, etc.) churn out first instead
+        // of displacing checkpoints from conversations that keep coming back.
+        std::uint64_t origin_hash      = 0;
+        bool protected_tier            = false;
     };
 
     struct Layout {
@@ -175,6 +182,8 @@ private:
 
     [[nodiscard]] Record& require(std::uint64_t entry_id);
     [[nodiscard]] const Record& require(std::uint64_t entry_id) const;
+    [[nodiscard]] bool lineage_is_hot(std::uint64_t origin_hash) const;
+    void note_lineage_hit(std::uint64_t origin_hash);
     void evict_unpinned();
     void destroy_record(std::uint64_t entry_id, bool count_eviction);
     void begin_copies(Record& record, cudaStream_t stream);
@@ -194,6 +203,12 @@ private:
     HostPinnedArena arena_;
     std::deque<std::uint64_t> fifo_;
     std::unordered_map<std::uint64_t, Record> records_;
+    // Bounded record of which content lineages (leading-token hash) have previously produced a
+    // cache hit, so a new capture for the same conversation can start out protected. Capped and
+    // FIFO-evicted independently of the KV entries themselves -- this is a small hint table, not
+    // a source of truth.
+    std::unordered_map<std::uint64_t, std::uint32_t> lineage_hits_;
+    std::deque<std::uint64_t> lineage_order_;
     std::vector<RetiredCopy> retired_;
     std::vector<std::uint64_t> pending_save_ids_;
     std::optional<std::uint64_t> pending_load_id_;

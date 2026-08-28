@@ -23,6 +23,26 @@ std::size_t align_up(std::size_t value, std::size_t align) {
     return (value + align - 1) & ~(align - 1);
 }
 
+constexpr std::size_t kLineageAnchorTokens = 256;
+constexpr std::size_t kLineageCacheCap     = 2048;
+
+// FNV-1a over the leading tokens of a capture's ledger. This is a lineage hint, not an identity
+// check: two different conversations sharing the same system prompt/tool schema prefix will
+// collide here, which only makes the cache slightly more generous about what counts as "hot" --
+// exact-content correctness for reuse itself is still enforced separately via prefix_matches().
+std::uint64_t hash_origin(std::span<const TokenId> ledger) {
+    const std::size_t count = std::min(ledger.size(), kLineageAnchorTokens);
+    std::uint64_t hash      = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto value = static_cast<std::uint32_t>(ledger[i]);
+        for (int shift = 0; shift < 32; shift += 8) {
+            hash ^= static_cast<std::uint8_t>(value >> shift);
+            hash *= 1099511628211ULL;
+        }
+    }
+    return hash;
+}
+
 struct Cursor {
     std::uint8_t* p   = nullptr;
     std::uint8_t* end = nullptr;
@@ -465,7 +485,35 @@ void KVRamCache::reap_retired(bool block) {
     retired_.resize(keep);
 }
 
+bool KVRamCache::lineage_is_hot(std::uint64_t origin_hash) const {
+    const auto it = lineage_hits_.find(origin_hash);
+    return it != lineage_hits_.end() && it->second > 0;
+}
+
+void KVRamCache::note_lineage_hit(std::uint64_t origin_hash) {
+    const auto [it, inserted] = lineage_hits_.try_emplace(origin_hash, 0);
+    if (inserted) {
+        lineage_order_.push_back(origin_hash);
+        while (lineage_order_.size() > kLineageCacheCap) {
+            lineage_hits_.erase(lineage_order_.front());
+            lineage_order_.pop_front();
+        }
+    }
+    if (it->second < std::numeric_limits<std::uint32_t>::max()) { ++it->second; }
+}
+
 void KVRamCache::evict_unpinned() {
+    // Two-pass: prefer displacing probationary (never-hit) entries first, so a burst of
+    // short one-shot captures cannot evict a checkpoint from a conversation that has already
+    // demonstrated reuse. Fall back to protected entries only when no probationary entry is
+    // available, so capture() is still guaranteed forward progress.
+    for (std::uint64_t id : fifo_) {
+        const auto it = records_.find(id);
+        if (it != records_.end() && !it->second.pinned && !it->second.protected_tier) {
+            destroy_record(id, true);
+            return;
+        }
+    }
     for (std::uint64_t id : fifo_) {
         const auto it = records_.find(id);
         if (it != records_.end() && !it->second.pinned) {
@@ -493,6 +541,7 @@ void KVRamCache::consume(std::uint64_t entry_id) {
     Record& record = require(entry_id);
     if (!record.pinned) { throw std::logic_error("RAM cache consume requires a claimed entry"); }
     ++restores_;
+    note_lineage_hit(record.origin_hash);
     retire_record(record);
     records_.erase(entry_id);
     fifo_.erase(std::remove(fifo_.begin(), fifo_.end(), entry_id), fifo_.end());
@@ -754,6 +803,8 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
                                          : PrefixReusePath::RestoreResponseCheckpoint;
         record.block               = block;
         record.bytes               = header.entry_bytes;
+        record.origin_hash         = hash_origin(source.ledger);
+        record.protected_tier      = lineage_is_hot(record.origin_hash);
         record.copies_start        = copies_start;
         copies_start               = nullptr;
         const auto [it, inserted]  = records_.emplace(record.id, record);
