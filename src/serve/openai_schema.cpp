@@ -152,6 +152,11 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
                         "messages");
         }
         const std::string type = part.at("type").get<std::string>();
+        if (turn.role == ChatRole::Tool && type != "text") {
+            bad_request("tool message " + std::to_string(index) +
+                            " content parts must have type 'text'",
+                        "messages");
+        }
         ContentPart out;
         out.type_raw = type;
         if (type == "text") {

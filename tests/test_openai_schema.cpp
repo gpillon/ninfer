@@ -467,19 +467,52 @@ int test_parse_tool_history_messages() {
                                       {"function", Json{{"name", "get_weather"},
                                                         {"arguments", R"({"city":"Paris"})"}}}}})}},
               Json{{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", R"({"temp":20})"}}})}};
-    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
-    failures += check(req.messages.size() == 3, "tool history message count");
-    failures += check(req.messages[1].tool_calls.size() == 1, "assistant tool call parsed");
-    failures += check(req.messages[1].tool_calls[0].id == "call_1", "tool call id parsed");
-    failures += check(req.messages[1].tool_calls[0].name == "get_weather", "tool call name parsed");
-    failures += check(req.messages[1].tool_calls[0].arguments_json == R"({"city":"Paris"})",
-                      "tool call arguments parsed");
-    failures += check(req.messages[2].role == ninfer::ChatRole::Tool, "tool role parsed");
-    failures += check(req.messages[2].tool_call_id == "call_1", "tool_call_id parsed");
+    const GenerationRequest string_req = parse_chat_completion_request(body, default_limits());
+    failures += check(string_req.messages.size() == 3, "tool history message count");
+    failures += check(string_req.messages[1].tool_calls.size() == 1, "assistant tool call parsed");
+    failures += check(string_req.messages[1].tool_calls[0].id == "call_1", "tool call id parsed");
     failures +=
-        check(req.messages[2].content.at(0).text == R"({"temp":20})", "tool content parsed");
-    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
-                      "tool history preserves special tokens in Engine output");
+        check(string_req.messages[1].tool_calls[0].name == "get_weather", "tool call name parsed");
+    failures += check(string_req.messages[1].tool_calls[0].arguments_json == R"({"city":"Paris"})",
+                      "tool call arguments parsed");
+    failures += check(string_req.messages[2].role == ninfer::ChatRole::Tool, "tool role parsed");
+    failures += check(string_req.messages[2].tool_call_id == "call_1", "tool_call_id parsed");
+    failures += check(string_req.messages[2].content.at(0).text == R"({"temp":20})",
+                      "string tool content parsed");
+    failures +=
+        check(to_request_options(string_req, default_server()).output.preserve_special_tokens,
+              "tool history preserves special tokens in Engine output");
+
+    Json parts_body = body;
+    parts_body["messages"][2]["content"] =
+        Json::array({Json{{"type", "text"}, {"text", R"({"temp":20})"}},
+                     Json{{"type", "text"}, {"text", "sunny"}}});
+    const GenerationRequest parts_req = parse_chat_completion_request(parts_body, default_limits());
+    failures += check(parts_req.messages[2].content.size() == 2,
+                      "tool text-part array preserves every part");
+    failures += check(parts_req.messages[2].content[0].kind == ContentKind::Text &&
+                          parts_req.messages[2].content[0].text == R"({"temp":20})" &&
+                          parts_req.messages[2].content[1].kind == ContentKind::Text &&
+                          parts_req.messages[2].content[1].text == "sunny",
+                      "tool text-part array preserves order and text");
+
+    Json missing_content = body;
+    missing_content["messages"][2].erase("content");
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(missing_content, default_limits()); }),
+        "tool content is required");
+
+    for (const Json& invalid_content :
+         {Json(nullptr), Json::array(), Json(7), Json::array({Json{{"type", "text"}}}),
+          Json::array({Json{{"type", "text"}, {"text", 7}}}),
+          Json::array({Json{{"type", "image_url"},
+                            {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}}})}) {
+        Json invalid                      = body;
+        invalid["messages"][2]["content"] = invalid_content;
+        failures += check(
+            throws_api([&] { (void)parse_chat_completion_request(invalid, default_limits()); }),
+            "invalid tool content rejected");
+    }
 
     Json bad_args                                                     = body;
     bad_args["messages"][1]["tool_calls"][0]["function"]["arguments"] = R"(["Paris"])";
