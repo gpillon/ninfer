@@ -212,10 +212,12 @@ private:
             if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
         }
         const auto ram            = instance_.program->kv_ram_snapshot();
-        snapshot.kv_ram_captures  = ram.captures;
-        snapshot.kv_ram_restores  = ram.restores;
-        snapshot.kv_ram_evictions = ram.evictions;
-        snapshot.kv_ram_drops     = ram.drops;
+        snapshot.kv_ram_captures      = ram.captures;
+        snapshot.kv_ram_restores      = ram.restores;
+        snapshot.kv_ram_evictions     = ram.evictions;
+        snapshot.kv_ram_drops         = ram.drops;
+        snapshot.kv_ram_save_seconds  = ram.save_seconds;
+        snapshot.kv_ram_load_seconds  = ram.load_seconds;
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
     }
@@ -309,6 +311,8 @@ private:
         std::uint64_t remaining_service_work = 0;
         std::uint64_t backfill_epoch         = 0;
         BackfillClass backfill_class         = BackfillClass::None;
+        double kv_ram_save_seconds           = 0;
+        double kv_ram_load_seconds           = 0;
 
         std::mutex mutex;
         std::condition_variable cv;
@@ -444,6 +448,8 @@ private:
             result.prefix_reuse_path      = request->begin->prefix_reuse_path;
             result.prefix_reuse_source    = request->begin->prefix_reuse_source;
         }
+        result.kv_ram_save_seconds = request->kv_ram_save_seconds;
+        result.kv_ram_load_seconds = request->kv_ram_load_seconds;
         if (request->lane) {
             result.timings = instance_.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
@@ -935,6 +941,9 @@ private:
                 request->lane_plans[lane].reset();
             }
             if (!erase_pending(request)) {
+                const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
+                request->kv_ram_save_seconds += copies.save;
+                request->kv_ram_load_seconds += copies.load;
                 release_ram_if_needed();
                 return AdmissionProgress::None;
             }
@@ -976,6 +985,9 @@ private:
             target_started = true;
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient);
+            const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
+            request->kv_ram_save_seconds = copies.save;
+            request->kv_ram_load_seconds = copies.load;
             if (ram_hit) {
                 instance_.program->consume_ram_entry(choice.ram_entry_id);
                 ram_consumed = true;
@@ -989,6 +1001,9 @@ private:
             return AdmissionProgress::RanGpuUnit;
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
+            const auto copies              = instance_.program->harvest_kv_ram_copy_seconds();
+            request->kv_ram_save_seconds += copies.save;
+            request->kv_ram_load_seconds += copies.load;
             release_ram_if_needed();
             if (target_started) { instance_.program->abort_lane(lane); }
             if (prefill_lane_ && *prefill_lane_ == lane) {

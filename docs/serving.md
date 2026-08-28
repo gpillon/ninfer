@@ -512,7 +512,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v10 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v11 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -523,12 +523,14 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, pinned-host KV RAM capacity/occupancy, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram`), unrounded phase seconds, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram`), unrounded phase seconds including `kv_ram_save` / `kv_ram_load`, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
-| `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
+| `throughput` | interval token deltas and rates, scheduler occupancy, interval `timings_seconds.kv_ram_save` / `kv_ram_load`, and decode-round batch statistics |
 
-`request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
-as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
+`request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, `total`,
+`kv_ram_save`, and `kv_ram_load` as full-precision JSON numbers. `kv_ram_save` / `kv_ram_load` are
+CUDA D2H/H2D elapsed for that request's admission spills and RAM restore. Throughput events repeat
+those two keys as interval sums. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 
@@ -590,13 +592,15 @@ uses a direct page-capacity calculation rather than allocation probing. Startup 
 resolved capacity, runtime reservation, free memory after weights, automatic headroom, planned
 slack, actual free memory after complete startup, observed Graph memory, and pinned-host KV RAM
 occupancy in MiB. When `--kv-ram-capacity` is enabled, a post-warmup line reprints occupancy,
-periodic throughput lines print live host-resident occupancy plus capture/restore/evict/drop
-counts, and each `[req] done` line includes `reuse_source=` plus the same occupancy and counters.
-`used`/`entries` count chats still in the host FIFO, not chats already consumed after a restore
-onto a KV lane.
+periodic throughput lines print live host-resident `kv-ram=` used bytes plus `n=` / `restores=` /
+`evicts=` / `drops=` / `save=` / `load=`, and each `[req] done` line includes `reuse_source=` plus
+the same occupancy and counters. `kv-ram=` / `n=` count chats still in the host FIFO, not chats
+already consumed after a restore onto a KV lane. `save=` / `load=` are CUDA D2H/H2D elapsed for
+that request or the throughput interval. `restores=` / `evicts=` / `drops=` are lifetime counters
+on both human lines; lifetime capture counts stay in JSONL.
 Exact RAM byte occupancy remains in `server_start`, `request_done`, and `throughput` JSONL; set
 `NINFER_KV_RAM_LOG_BYTES=1` to print those byte values on the human lines. A new capture may still
-reap or evict while logged `used` looks low. An explicit capacity is never silently reduced, and
+reap or evict while logged `kv-ram=` looks low. An explicit capacity is never silently reduced, and
 neither policy permits request-time pool growth.
 
 Admission reserves the full prompt-plus-effective-output page entitlement, so an admitted request

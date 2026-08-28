@@ -317,6 +317,10 @@ KVRamCache::~KVRamCache() {
     for (std::uint64_t id : ids) {
         auto it = records_.find(id);
         if (it == records_.end()) { continue; }
+        if (it->second.copies_start != nullptr) {
+            (void)cudaEventDestroy(it->second.copies_start);
+            it->second.copies_start = nullptr;
+        }
         if (it->second.copies_done != nullptr) {
             (void)cudaEventSynchronize(it->second.copies_done);
             (void)cudaEventDestroy(it->second.copies_done);
@@ -342,11 +346,17 @@ const KVRamCache::Record& KVRamCache::require(std::uint64_t entry_id) const {
 void KVRamCache::destroy_record(std::uint64_t entry_id, bool count_eviction) {
     auto it = records_.find(entry_id);
     if (it == records_.end()) { return; }
+    orphaned_save_seconds_ += harvest_record(it->second);
     wait_copies(it->second);
+    if (it->second.copies_start != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(it->second.copies_start));
+        it->second.copies_start = nullptr;
+    }
     if (it->second.copies_done != nullptr) {
         CUDA_CHECK(cudaEventDestroy(it->second.copies_done));
         it->second.copies_done = nullptr;
     }
+    it->second.copies_timed = false;
     if (it->second.block != nullptr) { arena_.free(it->second.block); }
     records_.erase(it);
     fifo_.erase(std::remove(fifo_.begin(), fifo_.end(), entry_id), fifo_.end());
@@ -354,11 +364,58 @@ void KVRamCache::destroy_record(std::uint64_t entry_id, bool count_eviction) {
     bump_version();
 }
 
-void KVRamCache::record_copies(Record& record, cudaStream_t stream) {
-    if (record.copies_done == nullptr) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&record.copies_done, cudaEventDisableTiming));
+void KVRamCache::begin_copies(Record& record, cudaStream_t stream) {
+    if (record.copies_start != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(record.copies_start));
+        record.copies_start = nullptr;
     }
+    CUDA_CHECK(cudaEventCreate(&record.copies_start));
+    CUDA_CHECK(cudaEventRecord(record.copies_start, stream));
+    record.copies_timed = false;
+}
+
+void KVRamCache::record_copies(Record& record, cudaStream_t stream) {
+    if (record.copies_done == nullptr) { CUDA_CHECK(cudaEventCreate(&record.copies_done)); }
     CUDA_CHECK(cudaEventRecord(record.copies_done, stream));
+    record.copies_timed = record.copies_start != nullptr;
+}
+
+double KVRamCache::harvest_record(Record& record) {
+    if (!record.copies_timed || record.copies_start == nullptr || record.copies_done == nullptr) {
+        return 0;
+    }
+    wait_copies(record);
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, record.copies_start, record.copies_done));
+    record.copies_timed = false;
+    CUDA_CHECK(cudaEventDestroy(record.copies_start));
+    record.copies_start = nullptr;
+    return static_cast<double>(milliseconds) / 1000.0;
+}
+
+KvRamCopySeconds KVRamCache::harvest_copy_seconds() {
+    KvRamCopySeconds out;
+    out.save += orphaned_save_seconds_;
+    save_seconds_ += orphaned_save_seconds_;
+    orphaned_save_seconds_ = 0;
+    for (std::uint64_t id : pending_save_ids_) {
+        const auto it = records_.find(id);
+        if (it == records_.end()) { continue; }
+        const double seconds = harvest_record(it->second);
+        out.save += seconds;
+        save_seconds_ += seconds;
+    }
+    pending_save_ids_.clear();
+    if (pending_load_id_) {
+        const auto it = records_.find(*pending_load_id_);
+        if (it != records_.end()) {
+            const double seconds = harvest_record(it->second);
+            out.load += seconds;
+            load_seconds_ += seconds;
+        }
+        pending_load_id_.reset();
+    }
+    return out;
 }
 
 void KVRamCache::wait_copies(Record& record) {
@@ -498,6 +555,8 @@ KvRamSnapshot KVRamCache::snapshot() const noexcept {
         .restores       = restores_,
         .evictions      = evictions_,
         .drops          = drops_,
+        .save_seconds   = save_seconds_,
+        .load_seconds   = load_seconds_,
     };
 }
 
@@ -608,6 +667,7 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
 
     bool copies_launched = false;
     std::uint64_t live_id  = 0;
+    cudaEvent_t copies_start = nullptr;
     try {
         auto* raw = static_cast<std::uint8_t*>(block);
         std::memset(raw, 0, header_bytes);
@@ -627,17 +687,25 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
             std::memcpy(raw + header.offset[0], source.ledger.data(), lengths[0]);
         }
         if (lengths[1] != 0) { source.identity->pack(raw + header.offset[1]); }
+        const auto start_device_copies = [&] {
+            if (copies_start != nullptr) { return; }
+            CUDA_CHECK(cudaEventCreate(&copies_start));
+            CUDA_CHECK(cudaEventRecord(copies_start, source.stream));
+        };
         if (lengths[2] != 0) {
+            start_device_copies();
             pack_paged_kv_allocation_to_host(*source.text, *source.text_pool, raw + header.offset[2],
                                              source.stream);
             copies_launched = true;
         }
         if (source.backend != nullptr && lengths[3] != 0) {
+            start_device_copies();
             pack_paged_kv_allocation_to_host(*source.backend, *source.backend_pool,
                                              raw + header.offset[3], source.stream);
             copies_launched = true;
         }
         if (source.gdn != nullptr) {
+            start_device_copies();
             source.gdn->pack_slot_to_host(source.gdn_current_slot, raw + header.offset[4],
                                           raw + header.offset[6], source.stream);
             copies_launched = true;
@@ -647,22 +715,26 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
             }
         }
         if (source.tail_hidden != nullptr && lengths[8] != 0) {
+            start_device_copies();
             CUDA_CHECK(cudaMemcpyAsync(raw + header.offset[8], source.tail_hidden->data, lengths[8],
                                        cudaMemcpyDeviceToHost, source.stream));
             copies_launched = true;
         }
         if (source.rewrite_checkpoint_hidden != nullptr && lengths[9] != 0) {
+            start_device_copies();
             CUDA_CHECK(cudaMemcpyAsync(raw + header.offset[9],
                                        source.rewrite_checkpoint_hidden->data, lengths[9],
                                        cudaMemcpyDeviceToHost, source.stream));
             copies_launched = true;
         }
         if (source.dflash_local != nullptr && lengths[10] != 0) {
+            start_device_copies();
             source.dflash_local->copy_lane_to_host(source.dflash_lane, raw + header.offset[10],
                                                    source.stream);
             copies_launched = true;
         }
         if (source.dflash_checkpoint != nullptr && lengths[11] != 0) {
+            start_device_copies();
             source.dflash_checkpoint->copy_lane_to_host(source.dflash_lane, raw + header.offset[11],
                                                         source.stream);
             copies_launched = true;
@@ -682,11 +754,14 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
                                          : PrefixReusePath::RestoreResponseCheckpoint;
         record.block               = block;
         record.bytes               = header.entry_bytes;
+        record.copies_start        = copies_start;
+        copies_start               = nullptr;
         const auto [it, inserted]  = records_.emplace(record.id, record);
         if (!inserted) { throw std::logic_error("RAM cache entry id already exists"); }
         live_id = record.id;
         fifo_.push_back(record.id);
         record_copies(it->second, source.stream);
+        pending_save_ids_.push_back(record.id);
         ++captures_;
         bump_version();
         return true;
@@ -698,6 +773,7 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
                 (void)cudaDeviceSynchronize();
             }
         }
+        if (copies_start != nullptr) { (void)cudaEventDestroy(copies_start); }
         if (live_id != 0) {
             destroy_record(live_id, false);
         } else {
@@ -748,6 +824,7 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
         throw std::logic_error("RAM entry hidden geometry mismatch");
     }
 
+    begin_copies(record, target.stream);
     unpack_paged_kv_allocation_from_host(*target.text, *target.text_pool, raw + header.offset[2],
                                          header.text_mapped_pages, target.text_dst_pages,
                                          target.stream);
@@ -786,6 +863,7 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
                                                       target.stream);
     }
     record_copies(record, target.stream);
+    pending_load_id_ = entry_id;
     return host_from_header(record.block, header);
 }
 

@@ -416,6 +416,9 @@ struct GenerationResult {
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     PrefixReuseSource prefix_reuse_source = PrefixReuseSource::None;
+    // CUDA D2H/H2D elapsed for this request's admission spills and RAM restore.
+    double kv_ram_save_seconds = 0;
+    double kv_ram_load_seconds = 0;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };
@@ -481,6 +484,8 @@ struct RuntimeStats {
     std::uint64_t kv_ram_restores       = 0;
     std::uint64_t kv_ram_evictions      = 0;
     std::uint64_t kv_ram_drops          = 0;
+    double kv_ram_save_seconds          = 0;
+    double kv_ram_load_seconds          = 0;
 };
 
 struct LoadSummary {

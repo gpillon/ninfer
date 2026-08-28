@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 10;
+inline constexpr int kRequestLogSchemaVersion        = 11;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -80,6 +80,8 @@ struct ThroughputReport {
     std::size_t kv_ram_capacity_bytes = 0;
     std::size_t kv_ram_used_bytes     = 0;
     std::size_t kv_ram_entry_count    = 0;
+    double kv_ram_save_seconds        = 0;
+    double kv_ram_load_seconds        = 0;
 };
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,

@@ -405,6 +405,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.kv_ram_restores             = stats.kv_ram_restores;
     outcome.metrics.kv_ram_evictions            = stats.kv_ram_evictions;
     outcome.metrics.kv_ram_drops                = stats.kv_ram_drops;
+    outcome.metrics.kv_ram_save_seconds         = result.kv_ram_save_seconds;
+    outcome.metrics.kv_ram_load_seconds         = result.kv_ram_load_seconds;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;

@@ -18,6 +18,12 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+std::string format_ms(double seconds) {
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(0) << seconds * 1000.0 << "ms";
+    return output.str();
+}
+
 std::string format_seconds(double seconds) {
     std::ostringstream output;
     output << std::fixed << std::setprecision(3) << seconds << " s";
@@ -240,7 +246,9 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                  "captures=" + std::to_string(stats.kv_ram_captures) +
                      " restores=" + std::to_string(stats.kv_ram_restores) +
                      " evicts=" + std::to_string(stats.kv_ram_evictions) +
-                     " drops=" + std::to_string(stats.kv_ram_drops));
+                     " drops=" + std::to_string(stats.kv_ram_drops) +
+                     " save=" + format_ms(result.kv_ram_save_seconds) +
+                     " load=" + format_ms(result.kv_ram_load_seconds));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
     print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));

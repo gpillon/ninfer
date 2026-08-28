@@ -1073,6 +1073,11 @@ qwen3_6::detail::KvRamSnapshot ProgramImplCore::kv_ram_snapshot() const noexcept
     return kv_ram_cache_ ? kv_ram_cache_->snapshot() : qwen3_6::detail::KvRamSnapshot{};
 }
 
+qwen3_6::detail::KvRamCopySeconds ProgramImplCore::harvest_kv_ram_copy_seconds() {
+    return kv_ram_cache_ ? kv_ram_cache_->harvest_copy_seconds()
+                         : qwen3_6::detail::KvRamCopySeconds{};
+}
+
 std::uint64_t ProgramImplCore::kv_ram_index_version() const noexcept {
     return kv_ram_cache_ ? kv_ram_cache_->index_version() : 0;
 }

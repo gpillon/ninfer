@@ -126,6 +126,7 @@ public:
     [[nodiscard]] RamRestoredHost load_host(std::uint64_t entry_id) const;
 
     [[nodiscard]] KvRamSnapshot snapshot() const noexcept;
+    KvRamCopySeconds harvest_copy_seconds();
     [[nodiscard]] std::uint64_t index_version() const noexcept { return index_version_; }
     [[nodiscard]] std::uint64_t exact_comparisons() const noexcept { return exact_comparisons_; }
 
@@ -160,6 +161,8 @@ private:
         void* block                    = nullptr;
         std::size_t bytes              = 0;
         bool pinned                    = false;
+        bool copies_timed              = false;
+        cudaEvent_t copies_start       = nullptr;
         cudaEvent_t copies_done        = nullptr;
     };
 
@@ -174,9 +177,11 @@ private:
     [[nodiscard]] const Record& require(std::uint64_t entry_id) const;
     void evict_unpinned();
     void destroy_record(std::uint64_t entry_id, bool count_eviction);
+    void begin_copies(Record& record, cudaStream_t stream);
     void record_copies(Record& record, cudaStream_t stream);
     void wait_copies(Record& record);
     void wait_copies_on_stream(Record& record, cudaStream_t stream);
+    double harvest_record(Record& record);
     void retire_record(Record& record);
     void reap_retired(bool block);
     void bump_version() noexcept { ++index_version_; }
@@ -190,6 +195,8 @@ private:
     std::deque<std::uint64_t> fifo_;
     std::unordered_map<std::uint64_t, Record> records_;
     std::vector<RetiredCopy> retired_;
+    std::vector<std::uint64_t> pending_save_ids_;
+    std::optional<std::uint64_t> pending_load_id_;
     std::uint64_t next_id_           = 1;
     std::uint64_t index_version_     = 1;
     std::uint64_t captures_          = 0;
@@ -197,6 +204,9 @@ private:
     std::uint64_t evictions_         = 0;
     std::uint64_t drops_             = 0;
     std::uint64_t exact_comparisons_ = 0;
+    double save_seconds_             = 0;
+    double load_seconds_             = 0;
+    double orphaned_save_seconds_    = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail

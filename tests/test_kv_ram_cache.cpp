@@ -525,6 +525,12 @@ int test_unpack_consume_and_drop(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
         source.release();
         return 1;
     }
+    const auto saved = cache.harvest_copy_seconds();
+    if (saved.save < 0.0 || saved.load != 0.0 || cache.snapshot().save_seconds != saved.save) {
+        std::cerr << "capture copy elapsed was not harvested as save\n";
+        source.release();
+        return 1;
+    }
     source.release();
 
     const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
@@ -542,6 +548,11 @@ int test_unpack_consume_and_drop(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
     full_target.stream         = ctx.stream;
     cache.claim(match->entry_id);
     (void)cache.unpack_device(match->entry_id, full_target);
+    const auto loaded = cache.harvest_copy_seconds();
+    if (loaded.save != 0.0 || loaded.load < 0.0 || cache.snapshot().load_seconds != loaded.load) {
+        std::cerr << "restore copy elapsed was not harvested as load\n";
+        ++failures;
+    }
     cache.consume(match->entry_id);
     if (cache.snapshot().entry_count != 0 || cache.snapshot().restores != 1 ||
         cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt))) {

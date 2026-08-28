@@ -318,6 +318,22 @@ std::string speculative_str(const GenerationMetrics& metrics) {
     return out.str();
 }
 
+bool kv_ram_log_exact_bytes() {
+    const char* text = std::getenv("NINFER_KV_RAM_LOG_BYTES");
+    return text != nullptr && text[0] != '\0' && text[0] != '0';
+}
+
+std::string format_kv_ram_live(const ninfer::MemorySummary& memory, std::uint64_t restores,
+                               std::uint64_t evictions, std::uint64_t drops, double save_seconds,
+                               double load_seconds) {
+    std::ostringstream out;
+    out << " kv-ram=" << format_kv_ram_size(memory.kv_ram_used_bytes, kv_ram_log_exact_bytes())
+        << " n=" << memory.kv_ram_entry_count << " restores=" << restores
+        << " evicts=" << evictions << " drops=" << drops << std::fixed << std::setprecision(0)
+        << " save=" << (save_seconds * 1000.0) << "ms load=" << (load_seconds * 1000.0) << "ms";
+    return out.str();
+}
+
 } // namespace
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
@@ -425,11 +441,9 @@ std::string format_request_done(const RequestLogContext& context,
         occupancy.kv_ram_capacity_bytes = metrics.kv_ram_capacity_bytes;
         occupancy.kv_ram_used_bytes     = metrics.kv_ram_used_bytes;
         occupancy.kv_ram_entry_count    = metrics.kv_ram_entry_count;
-        out << " kv-ram=" << format_kv_ram_occupancy(occupancy)
-            << " ram_captures=" << metrics.kv_ram_captures
-            << " ram_restores=" << metrics.kv_ram_restores
-            << " ram_evicts=" << metrics.kv_ram_evictions
-            << " ram_drops=" << metrics.kv_ram_drops;
+        out << format_kv_ram_live(occupancy, metrics.kv_ram_restores, metrics.kv_ram_evictions,
+                                  metrics.kv_ram_drops, metrics.kv_ram_save_seconds,
+                                  metrics.kv_ram_load_seconds);
     }
     out << " ttft=" << std::fixed
         << std::setprecision(0) << ttft_ms << "ms"
@@ -444,11 +458,6 @@ std::string format_request_error(const RequestLogContext& context, const std::st
     std::ostringstream out;
     out << "[req " << context.id << "] error " << message;
     return out.str();
-}
-
-static bool kv_ram_log_exact_bytes() {
-    const char* text = std::getenv("NINFER_KV_RAM_LOG_BYTES");
-    return text != nullptr && text[0] != '\0' && text[0] != '0';
 }
 
 std::string format_kv_ram_size(std::uint64_t bytes, bool exact_bytes) {
@@ -502,11 +511,9 @@ std::string format_throughput(const ThroughputReport& report) {
         occupancy.kv_ram_capacity_bytes = report.kv_ram_capacity_bytes;
         occupancy.kv_ram_used_bytes     = report.kv_ram_used_bytes;
         occupancy.kv_ram_entry_count    = report.kv_ram_entry_count;
-        out << " kv-ram=" << format_kv_ram_occupancy(occupancy)
-            << " ram_captures=" << report.scheduler.kv_ram_captures
-            << " ram_restores=" << report.scheduler.kv_ram_restores
-            << " ram_evicts=" << report.scheduler.kv_ram_evictions
-            << " ram_drops=" << report.scheduler.kv_ram_drops;
+        out << format_kv_ram_live(occupancy, report.scheduler.kv_ram_restores,
+                                  report.scheduler.kv_ram_evictions, report.scheduler.kv_ram_drops,
+                                  report.kv_ram_save_seconds, report.kv_ram_load_seconds);
     }
     return out.str();
 }
@@ -652,9 +659,14 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"kv_ram_drops", outcome.metrics.kv_ram_drops},
              {"tool_call_count", outcome.tool_calls.size()}};
     record["timings_seconds"] = Json{
-        {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
-        {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
-        {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
+        {"prepare", outcome.metrics.prepare_seconds},
+        {"ttft", outcome.metrics.ttft_seconds},
+        {"vision", outcome.metrics.vision_seconds},
+        {"prefill", outcome.metrics.prefill_seconds},
+        {"decode", outcome.metrics.decode_seconds},
+        {"total", outcome.metrics.total_seconds},
+        {"kv_ram_save", outcome.metrics.kv_ram_save_seconds},
+        {"kv_ram_load", outcome.metrics.kv_ram_load_seconds}};
     record["speculative"] = speculative_json(outcome.metrics);
     return record.dump();
 }
@@ -700,6 +712,9 @@ std::string format_throughput_json(const std::string& server_instance_id,
                                   {"kv_ram_capacity_bytes", report.kv_ram_capacity_bytes},
                                   {"kv_ram_used_bytes", report.kv_ram_used_bytes},
                                   {"kv_ram_entry_count", report.kv_ram_entry_count}};
+    record["timings_seconds"] =
+        Json{{"kv_ram_save", report.kv_ram_save_seconds},
+             {"kv_ram_load", report.kv_ram_load_seconds}};
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},
                                   {"row_rounds", report.decode_row_rounds},
                                   {"average_size", std::move(average_batch)}};

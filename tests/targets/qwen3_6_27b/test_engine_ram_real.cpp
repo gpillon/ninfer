@@ -265,6 +265,9 @@ int exercise_exclusive_occupancy(const char* artifact) {
     if (engine.runtime_stats().kv_ram_captures <= captures_after_a) {
         return fail("exclusive occupancy evictor did not capture A");
     }
+    if (first_b.kv_ram_save_seconds <= 0.0) {
+        return fail("exclusive occupancy evictor did not record D2H save elapsed");
+    }
     const ninfer::MemorySummary after_capture = engine.memory_summary();
     if (after_capture.kv_ram_entry_count != 1 || after_capture.kv_ram_used_bytes == 0) {
         std::cerr << "exclusive occupancy after capture: entries="
@@ -286,6 +289,9 @@ int exercise_exclusive_occupancy(const char* artifact) {
     if (engine.runtime_stats().kv_ram_restores != restores_before + 1 ||
         engine.runtime_stats().kv_ram_captures != captures_before_hit + 1) {
         return fail("exclusive occupancy RAM hit did not consume A and capture the victim");
+    }
+    if (hit_a.kv_ram_load_seconds <= 0.0) {
+        return fail("exclusive occupancy RAM hit did not record H2D load elapsed");
     }
     const ninfer::MemorySummary after_hit = engine.memory_summary();
     if (after_hit.kv_ram_entry_count != 1 || after_hit.kv_ram_used_bytes == 0) {

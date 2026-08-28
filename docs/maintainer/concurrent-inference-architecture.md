@@ -776,14 +776,15 @@ The executor captures at each admission site that is about to destroy a retained
 
 That capture is a fresh D2H of the current prefix and becomes the new FIFO tail. A later RAM hit
 exclusive-claims the matching host entry (pinned entries are invisible to later `plan_match`).
-`capture` and `unpack` record a CUDA event after the copies so CPU prefill setup can overlap
-restore H2D. Consume happens after the first non-throwing `start_prefill_lane`, including an
-incomplete first chunk: it erases that entry wherever it sits in the FIFO and retires the host
-block; a throw before consume releases the claim and leaves the host row in place. After consume
-the bundle lives only in VRAM until a later spill recaptures it. Occupancy `used`/`entries` count
-those live host residents, including a claimed-but-not-consumed pin, and exclude retired copy
+`capture` and `unpack` record a start CUDA event before the copies and a done event after them so
+CPU prefill setup can overlap restore H2D. Harvest of D2H/H2D elapsed happens after the first
+non-throwing `start_prefill_lane` and before consume. Consume then erases that entry wherever it
+sits in the FIFO and retires the host block, including after an incomplete first chunk; a throw
+before consume releases the claim and leaves the host row in place. After consume the bundle lives
+only in VRAM until a later spill recaptures it. Occupancy `used`/`entries` (human `kv-ram=` / `n=`)
+count those live host residents, including a claimed-but-not-consumed pin, and exclude retired copy
 blocks that still occupy the pin until reap. A later capture may still reap or evict while logged
-`used` looks low.
+occupancy looks low.
 
 The planner picks the larger `reusable_prompt_tokens` between VRAM and RAM; equal reuse keeps
 VRAM. VRAM `FullReset` and RAM restore both prefer a free lane with no retained bundle and cover a

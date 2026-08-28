@@ -46,6 +46,8 @@ struct GenerationMetrics {
     std::uint64_t kv_ram_restores     = 0;
     std::uint64_t kv_ram_evictions    = 0;
     std::uint64_t kv_ram_drops        = 0;
+    double kv_ram_save_seconds        = 0;
+    double kv_ram_load_seconds        = 0;
 };
 
 struct GenerationOutcome {

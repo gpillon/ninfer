@@ -272,6 +272,11 @@ qwen3_6::detail::KvRamSnapshot Program<Variant>::kv_ram_snapshot() const noexcep
 }
 
 template <>
+qwen3_6::detail::KvRamCopySeconds Program<Variant>::harvest_kv_ram_copy_seconds() {
+    return impl_->harvest_kv_ram_copy_seconds();
+}
+
+template <>
 std::uint64_t Program<Variant>::kv_ram_index_version() const noexcept {
     return impl_->kv_ram_index_version();
 }

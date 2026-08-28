@@ -187,6 +187,7 @@ public:
     void release_ram_entry(std::uint64_t entry_id);
     void consume_ram_entry(std::uint64_t entry_id);
     [[nodiscard]] qwen3_6::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
+    qwen3_6::detail::KvRamCopySeconds harvest_kv_ram_copy_seconds();
     [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;

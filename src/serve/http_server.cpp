@@ -91,6 +91,8 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
         .decode_rounds     = current.decode_rounds - previous.decode_rounds,
         .decode_row_rounds = current.decode_row_rounds - previous.decode_row_rounds,
         .scheduler         = current,
+        .kv_ram_save_seconds = current.kv_ram_save_seconds - previous.kv_ram_save_seconds,
+        .kv_ram_load_seconds = current.kv_ram_load_seconds - previous.kv_ram_load_seconds,
     };
 }
 
@@ -103,6 +105,7 @@ bool report_has_activity(const ThroughputReport& report, const ninfer::RuntimeSt
            report.scheduler.kv_ram_restores != previous.kv_ram_restores ||
            report.scheduler.kv_ram_evictions != previous.kv_ram_evictions ||
            report.scheduler.kv_ram_drops != previous.kv_ram_drops ||
+           report.kv_ram_save_seconds != 0.0 || report.kv_ram_load_seconds != 0.0 ||
            report.kv_ram_used_bytes != previous_used ||
            report.kv_ram_entry_count != previous_entries;
 }

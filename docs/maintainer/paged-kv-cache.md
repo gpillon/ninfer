@@ -819,7 +819,9 @@ state. Consume erases the host entry wherever it sits
 in the FIFO and retires the block; capacity eviction destroys the oldest unpinned resident and
 waits for its copy event before freeing. Both then follow the same checkpoint decision as VRAM
 prefix reuse.
-Logged `used`/`entries` are live host residents only. The host image packs logical page `i`
+Logged `used`/`entries` (human `kv-ram=` / `n=`) are live host residents only. Serve and CLI also
+print CUDA D2H `save=` and H2D `load=` elapsed harvested after the first non-throwing
+`start_prefill_lane`. The host image packs logical page `i`
 densely and neither stores nor sorts physical page IDs. A RAM hit still requires a complete
 SequenceState proof; active pages are not moved because of RAM capture/restore. Capacity is fixed
 in MiB by `--kv-ram-capacity`, default off; a failed `cudaHostAlloc` fails Engine construction.
