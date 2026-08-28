@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -115,6 +116,18 @@ const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {
 
 const char* proposal_head_name(ninfer::ProposalHead proposal) {
     return proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full";
+}
+
+const char* prefix_reuse_source_name(ninfer::PrefixReuseSource source) {
+    switch (source) {
+    case ninfer::PrefixReuseSource::None:
+        return "none";
+    case ninfer::PrefixReuseSource::VramResident:
+        return "vram_resident";
+    case ninfer::PrefixReuseSource::HostRam:
+        return "host_ram";
+    }
+    return "unknown";
 }
 
 const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
@@ -405,7 +418,20 @@ std::string format_request_done(const RequestLogContext& context,
     if (!outcome.tool_calls.empty()) { out << " tool_calls=" << outcome.tool_calls.size(); }
     out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
         << " cache=" << metrics.prefix_cache_hit_tokens
-        << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path) << " ttft=" << std::fixed
+        << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path)
+        << " reuse_source=" << prefix_reuse_source_name(metrics.prefix_reuse_source);
+    if (metrics.kv_ram_capacity_bytes != 0) {
+        ninfer::MemorySummary occupancy;
+        occupancy.kv_ram_capacity_bytes = metrics.kv_ram_capacity_bytes;
+        occupancy.kv_ram_used_bytes     = metrics.kv_ram_used_bytes;
+        occupancy.kv_ram_entry_count    = metrics.kv_ram_entry_count;
+        out << " kv-ram=" << format_kv_ram_occupancy(occupancy)
+            << " ram_captures=" << metrics.kv_ram_captures
+            << " ram_restores=" << metrics.kv_ram_restores
+            << " ram_evicts=" << metrics.kv_ram_evictions
+            << " ram_drops=" << metrics.kv_ram_drops;
+    }
+    out << " ttft=" << std::fixed
         << std::setprecision(0) << ttft_ms << "ms"
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
@@ -417,6 +443,34 @@ std::string format_request_done(const RequestLogContext& context,
 std::string format_request_error(const RequestLogContext& context, const std::string& message) {
     std::ostringstream out;
     out << "[req " << context.id << "] error " << message;
+    return out.str();
+}
+
+static bool kv_ram_log_exact_bytes() {
+    const char* text = std::getenv("NINFER_KV_RAM_LOG_BYTES");
+    return text != nullptr && text[0] != '\0' && text[0] != '0';
+}
+
+std::string format_kv_ram_size(std::uint64_t bytes, bool exact_bytes) {
+    if (exact_bytes) { return std::to_string(bytes) + " B"; }
+    constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
+    std::ostringstream out;
+    if (bytes % kMiB == 0) {
+        out << (bytes / kMiB) << " MiB";
+    } else {
+        out << std::fixed << std::setprecision(1)
+            << static_cast<double>(bytes) / static_cast<double>(kMiB) << " MiB";
+    }
+    return out.str();
+}
+
+std::string format_kv_ram_occupancy(const ninfer::MemorySummary& memory) {
+    if (memory.kv_ram_capacity_bytes == 0) { return "off"; }
+    const bool exact = kv_ram_log_exact_bytes();
+    std::ostringstream out;
+    out << format_kv_ram_size(memory.kv_ram_capacity_bytes, exact) << " used="
+        << format_kv_ram_size(memory.kv_ram_used_bytes, exact)
+        << " entries=" << memory.kv_ram_entry_count;
     return out.str();
 }
 
@@ -442,6 +496,17 @@ std::string format_throughput(const ThroughputReport& report) {
         out << std::setprecision(2)
             << static_cast<double>(report.decode_row_rounds) /
                    static_cast<double>(report.decode_rounds);
+    }
+    if (report.kv_ram_capacity_bytes != 0) {
+        ninfer::MemorySummary occupancy;
+        occupancy.kv_ram_capacity_bytes = report.kv_ram_capacity_bytes;
+        occupancy.kv_ram_used_bytes     = report.kv_ram_used_bytes;
+        occupancy.kv_ram_entry_count    = report.kv_ram_entry_count;
+        out << " kv-ram=" << format_kv_ram_occupancy(occupancy)
+            << " ram_captures=" << report.scheduler.kv_ram_captures
+            << " ram_restores=" << report.scheduler.kv_ram_restores
+            << " ram_evicts=" << report.scheduler.kv_ram_evictions
+            << " ram_drops=" << report.scheduler.kv_ram_drops;
     }
     return out.str();
 }
@@ -501,6 +566,9 @@ std::string format_server_start_json(
           {"vision", options.enable_vision},
           {"cuda_graph", options.use_cuda_graph},
           {"prefix_reuse", options.allow_prefix_reuse},
+          {"kv_ram_capacity_bytes", memory.kv_ram_capacity_bytes},
+          {"kv_ram_used_bytes", memory.kv_ram_used_bytes},
+          {"kv_ram_entry_count", memory.kv_ram_entry_count},
           {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
           {"speculative_draft_window", options.speculative.draft_tokens},
           {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
@@ -524,7 +592,10 @@ std::string format_server_start_json(
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"cuda_graph_observed_bytes", memory.cuda_graph_observed_bytes},
-             {"kv_payload_bytes", memory.kv_payload_bytes}};
+             {"kv_payload_bytes", memory.kv_payload_bytes},
+             {"kv_ram_capacity_bytes", memory.kv_ram_capacity_bytes},
+             {"kv_ram_used_bytes", memory.kv_ram_used_bytes},
+             {"kv_ram_entry_count", memory.kv_ram_entry_count}};
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},
@@ -571,6 +642,14 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                               static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
+             {"reuse_source", prefix_reuse_source_name(outcome.metrics.prefix_reuse_source)},
+             {"kv_ram_capacity_bytes", outcome.metrics.kv_ram_capacity_bytes},
+             {"kv_ram_used_bytes", outcome.metrics.kv_ram_used_bytes},
+             {"kv_ram_entry_count", outcome.metrics.kv_ram_entry_count},
+             {"kv_ram_captures", outcome.metrics.kv_ram_captures},
+             {"kv_ram_restores", outcome.metrics.kv_ram_restores},
+             {"kv_ram_evictions", outcome.metrics.kv_ram_evictions},
+             {"kv_ram_drops", outcome.metrics.kv_ram_drops},
              {"tool_call_count", outcome.tool_calls.size()}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
@@ -613,7 +692,14 @@ std::string format_throughput_json(const std::string& server_instance_id,
     record["scheduler"]    = Json{{"running", report.scheduler.running_requests},
                                   {"prefilling", report.scheduler.prefilling_requests},
                                   {"decode_ready", report.scheduler.decode_ready_requests},
-                                  {"waiting", report.scheduler.waiting_requests}};
+                                  {"waiting", report.scheduler.waiting_requests},
+                                  {"kv_ram_captures", report.scheduler.kv_ram_captures},
+                                  {"kv_ram_restores", report.scheduler.kv_ram_restores},
+                                  {"kv_ram_evictions", report.scheduler.kv_ram_evictions},
+                                  {"kv_ram_drops", report.scheduler.kv_ram_drops},
+                                  {"kv_ram_capacity_bytes", report.kv_ram_capacity_bytes},
+                                  {"kv_ram_used_bytes", report.kv_ram_used_bytes},
+                                  {"kv_ram_entry_count", report.kv_ram_entry_count}};
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},
                                   {"row_rounds", report.decode_row_rounds},
                                   {"average_size", std::move(average_batch)}};

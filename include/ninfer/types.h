@@ -82,6 +82,7 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    std::size_t kv_ram_capacity_bytes  = 0;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     // 0 (default): linear rope at the checkpoint's native positions. Any value > 1 selects
     // YaRN position scaling with that factor (HF/vLLM `yarn` semantics). The remaining YaRN
@@ -399,6 +400,12 @@ enum class PrefixReusePath : std::uint8_t {
     RestoreResponseCheckpoint,
 };
 
+enum class PrefixReuseSource : std::uint8_t {
+    None,
+    VramResident,
+    HostRam,
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
@@ -408,6 +415,7 @@ struct GenerationResult {
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+    PrefixReuseSource prefix_reuse_source = PrefixReuseSource::None;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };
@@ -448,6 +456,11 @@ struct MemorySummary {
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t cuda_graph_observed_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
+    std::size_t kv_ram_capacity_bytes             = 0;
+    // Live host-RAM residents only (claimed included). Not pinned-arena occupancy;
+    // a retired copy may still occupy the pin until its D2H/H2D event is reaped.
+    std::size_t kv_ram_used_bytes                 = 0;
+    std::size_t kv_ram_entry_count                = 0;
 };
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
@@ -464,6 +477,10 @@ struct RuntimeStats {
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;
     std::uint32_t waiting_requests      = 0;
+    std::uint64_t kv_ram_captures       = 0;
+    std::uint64_t kv_ram_restores       = 0;
+    std::uint64_t kv_ram_evictions      = 0;
+    std::uint64_t kv_ram_drops          = 0;
 };
 
 struct LoadSummary {

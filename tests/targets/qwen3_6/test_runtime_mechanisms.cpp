@@ -282,6 +282,48 @@ void test_prefix_identity() {
            "truncated multimodal continuation identity");
 }
 
+void test_prefix_hash_and_dflash_gate() {
+    q36::PreparedPromptData original = identity_prompt();
+    const auto chain                 = q36::detail::prefix_hash_chain(original);
+    expect(chain.size() == original.token_ids.size() + 1, "hash chain includes the empty prefix");
+
+    q36::detail::ResidentPrefixIdentity resident;
+    resident.assign(original);
+    for (std::size_t count = 0; count <= original.token_ids.size(); ++count) {
+        expect(q36::detail::prefix_hash_at(original.token_ids, resident, count) == chain[count],
+               "prefix_hash_at matches prefix_hash_chain");
+    }
+
+    q36::PreparedPromptData changed_token = original;
+    changed_token.token_ids.back() += 1;
+    const auto token_chain = q36::detail::prefix_hash_chain(changed_token);
+    expect(token_chain[original.token_ids.size() - 1] == chain[original.token_ids.size() - 1] &&
+               token_chain.back() != chain.back(),
+           "token difference changes only hashes at and after the mutated token");
+
+    q36::PreparedPromptData changed_type = original;
+    changed_type.token_types[0]          = 1;
+    expect(q36::detail::prefix_hash_chain(changed_type)[1] != chain[1],
+           "token_type difference changes the hash chain");
+
+    q36::PreparedPromptData changed_position = original;
+    changed_position.positions[0] += 1;
+    expect(q36::detail::prefix_hash_chain(changed_position).back() != chain.back(),
+           "position-axis difference changes the hash chain");
+
+    q36::PreparedPromptData changed_digest = identity_prompt(2);
+    const auto digest_chain                = q36::detail::prefix_hash_chain(changed_digest);
+    expect(digest_chain[2] == chain[2] && digest_chain[3] != chain[3],
+           "completing vision item changes the hash at its end");
+
+    expect(q36::detail::dflash_rewrite_checkpoint_ready(true, 16, 16),
+           "RAM DFlash checkpoint with backend_image_present must not FullReset");
+    expect(!q36::detail::dflash_rewrite_checkpoint_ready(false, 16, 16),
+           "missing backend image FullResets a DFlash checkpoint view");
+    expect(!q36::detail::dflash_rewrite_checkpoint_ready(true, 15, 16),
+           "short DFlash context frontier FullResets a checkpoint view");
+}
+
 } // namespace
 
 int main() {
@@ -291,6 +333,7 @@ int main() {
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
+    test_prefix_hash_and_dflash_gate();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

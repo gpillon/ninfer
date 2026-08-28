@@ -457,6 +457,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
@@ -519,10 +520,10 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
+| `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, pinned-host KV RAM capacity/occupancy, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram`), unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
 
@@ -580,14 +581,23 @@ sequence can never cross the exact `--max-context` frontier. `--kv-capacity N` r
 capacity; `--kv-capacity auto` chooses the largest legal capacity that fits the memory remaining
 after weights are loaded while keeping 1 GiB of sizing headroom. When omitted it follows
 `--max-context`, preserving one full-length request's capacity. The shared pool is fixed at startup
-and is not divided evenly among request lanes.
+and is not divided evenly among request lanes. `--kv-ram-capacity` is a separate pinned-host budget
+in MiB for completed prefix bundles and does not change GPU pool sizing.
 
 Automatic sizing evaluates the complete target runtime layout for the chosen concurrency, KV
 dtype, speculative backend, draft window, Vision setting, workspace, and CUDA Graph allowance. It
 uses a direct page-capacity calculation rather than allocation probing. Startup reports the policy,
 resolved capacity, runtime reservation, free memory after weights, automatic headroom, planned
-slack, actual free memory after complete startup, and observed Graph memory. An explicit capacity
-is never silently reduced, and neither policy permits request-time pool growth.
+slack, actual free memory after complete startup, observed Graph memory, and pinned-host KV RAM
+occupancy in MiB. When `--kv-ram-capacity` is enabled, a post-warmup line reprints occupancy,
+periodic throughput lines print live host-resident occupancy plus capture/restore/evict/drop
+counts, and each `[req] done` line includes `reuse_source=` plus the same occupancy and counters.
+`used`/`entries` count chats still in the host FIFO, not chats already consumed after a restore
+onto a KV lane.
+Exact RAM byte occupancy remains in `server_start`, `request_done`, and `throughput` JSONL; set
+`NINFER_KV_RAM_LOG_BYTES=1` to print those byte values on the human lines. A new capture may still
+reap or evict while logged `used` looks low. An explicit capacity is never silently reduced, and
+neither policy permits request-time pool growth.
 
 Admission reserves the full prompt-plus-effective-output page entitlement, so an admitted request
 can finish within its declared bound. A later request waits in FIFO order when the remaining shared

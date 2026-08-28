@@ -27,7 +27,9 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 
 ### 1.1 Non-goals
 
-- request preemption、swap、KV offload 或跨 GPU storage；
+- request preemption, swap, **active** KV offload, or cross-GPU storage; a completed retained
+  bundle may be kept in pinned host memory under `--kv-ram-capacity`, but that is not
+  active-request offload;
 - active requests 之间共享可写 prefix、page reference counting 或 copy-on-write branching；
 - arbitrary longest-common-prefix reuse；
 - 用一个 universal raw-byte allocator 在 serving 期间动态重分不同 KV layouts 的显存；
@@ -672,7 +674,9 @@ ordinary target progress，不构成 backend capability 降级，也不能据此
 完整、可继续的 bundle 一起 retain，要么释放整个 bundle。
 
 Admission 被 retained occupancy 阻塞时，Prefix Cache 选择并释放完整 retained entries，再重新执行
-atomic admission。KV Store 不自行选择 eviction victim。
+atomic admission。KV Store 不自行选择 eviction victim。The host-RAM second tier holds no pool
+pages: the pinned host image is an independent copy in logical-page order, and GPU pool page IDs
+and mapped counts still describe device allocations only.
 
 ---
 
@@ -800,6 +804,23 @@ pages 返回各自 pool；随后各 pool 的 exact frontier 和 fixed continuati
 连同 Linear Attention/backend state branching 一起重新设计；仅共享 Main Text pages 不能形成完整
 可继续的 sequence state。
 
+### 10.4 Host RAM second tier
+
+The optional pinned-host tier is an exclusive FIFO of completed retained SequenceState bundles
+that are not on a VRAM lane. Capture happens at the executor admission site that is about to
+destroy that bundle and appends a fresh D2H image at the FIFO tail. A capture that does not fit
+the host budget increments `drops` and the incoming request still proceeds. D2H completion is
+tracked with a per-entry CUDA event so the entry can be indexed before the copies drain. Restore
+writes the host image onto a new page mapping of the chosen free lane (an empty lane first; a
+dirty lane only when none is empty), records H2D completion on the same event, then start_prefill
+may overlap that copy on the CPU side. Consume erases the host entry wherever it sits in the FIFO
+and retires the block; capacity eviction destroys the oldest unpinned resident and waits for its
+copy event before freeing. Both then follow the same checkpoint decision as VRAM prefix reuse.
+Logged `used`/`entries` are live host residents only. The host image packs logical page `i`
+densely and neither stores nor sorts physical page IDs. A RAM hit still requires a complete
+SequenceState proof; active pages are not moved because of RAM capture/restore. Capacity is fixed
+in MiB by `--kv-ram-capacity`, default off; a failed `cudaHostAlloc` fails Engine construction.
+
 ---
 
 ## 11. Speculative decoding
@@ -917,8 +938,10 @@ route 无 fresh tensor，保持 sink+ring tail 覆盖。
 7. frontier publish 前，该 pool position 的完整 K/V 以及必要 code/scale planes 必须已经写入；
 8. page recycle 不要求清零，但新 owner 不得从旧 frontier 或 stale bytes 推导有效状态；
 9. page mapping 使用 cache ordinal，不使用 RoPE/MRoPE coordinate；
-10. prefix hit 必须由完整 SequenceState 证明，KV token match 或 page match 本身不构成 hit；
-11. active pages 不因 compaction、retained eviction 或其他 request growth 被搬迁；
+10. a prefix hit must be proven by a complete SequenceState; a KV token match, page match, or RAM
+    hash prefilter is not itself a hit; VRAM and RAM hits use the same checkpoint proof;
+11. active pages are not moved by compaction, retained eviction, host-RAM capture/restore, or other
+    request growth;
 12. admitted request 的合法最大 per-pool growth 必须始终被 reservation vector 覆盖；
 13. `KVCapacityProfile` 必须按 §3.2–§3.3 从 `max_context`、`kv_capacity`、`max_concurrency` 和 selected
     backend 唯一导出；MTP physical headroom 不扩大 per-allocation logical capacity，backend 不得先于

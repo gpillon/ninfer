@@ -164,6 +164,12 @@ RequestPlan<Variant> Program<Variant>::plan_request_for_lane(std::uint32_t lane,
 }
 
 template <>
+RequestPlan<Variant> Program<Variant>::plan_ram_reuse(const PreparedPrompt& prompt,
+                                                      const RequestBasePlan<Variant>& base) {
+    return impl_->plan_ram_reuse(PreparedPromptAccess::view(prompt), base);
+}
+
+template <>
 bool Program<Variant>::can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept {
     return impl_->can_admit_lane(lane, plan);
@@ -230,6 +236,42 @@ std::uint32_t Program<Variant>::retained_frontier_lane(std::uint32_t lane) const
 template <>
 void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
     impl_->evict_retained_lane(lane);
+}
+
+template <>
+bool Program<Variant>::capture_retained_lane(std::uint32_t lane) {
+    return impl_->capture_retained_lane(lane);
+}
+
+template <>
+void Program<Variant>::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,
+                                         const RequestPlan<Variant>& plan) {
+    impl_->restore_ram_entry(lane, entry_id, plan);
+}
+
+template <>
+void Program<Variant>::claim_ram_entry(std::uint64_t entry_id) {
+    impl_->claim_ram_entry(entry_id);
+}
+
+template <>
+void Program<Variant>::release_ram_entry(std::uint64_t entry_id) {
+    impl_->release_ram_entry(entry_id);
+}
+
+template <>
+void Program<Variant>::consume_ram_entry(std::uint64_t entry_id) {
+    impl_->consume_ram_entry(entry_id);
+}
+
+template <>
+qwen3_6::detail::KvRamSnapshot Program<Variant>::kv_ram_snapshot() const noexcept {
+    return impl_->kv_ram_snapshot();
+}
+
+template <>
+std::uint64_t Program<Variant>::kv_ram_index_version() const noexcept {
+    return impl_->kv_ram_index_version();
 }
 
 template <>

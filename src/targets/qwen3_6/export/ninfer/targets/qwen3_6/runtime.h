@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
+#include "targets/qwen3_6/impl/runtime/kv_ram_snapshot.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <cstddef>
@@ -154,6 +155,8 @@ public:
     [[nodiscard]] RequestPlan<Variant> plan_request_for_lane(std::uint32_t lane,
                                                              const PreparedPrompt& prompt,
                                                              const RequestBasePlan<Variant>& base);
+    [[nodiscard]] RequestPlan<Variant> plan_ram_reuse(const PreparedPrompt& prompt,
+                                                      const RequestBasePlan<Variant>& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] bool
@@ -177,6 +180,14 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint32_t retained_frontier_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
+    void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,
+                           const RequestPlan<Variant>& plan);
+    void claim_ram_entry(std::uint64_t entry_id);
+    void release_ram_entry(std::uint64_t entry_id);
+    void consume_ram_entry(std::uint64_t entry_id);
+    [[nodiscard]] qwen3_6::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
+    [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

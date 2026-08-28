@@ -38,6 +38,14 @@ struct GenerationMetrics {
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
+    ninfer::PrefixReuseSource prefix_reuse_source = ninfer::PrefixReuseSource::None;
+    std::size_t kv_ram_capacity_bytes = 0;
+    std::size_t kv_ram_used_bytes     = 0;
+    std::size_t kv_ram_entry_count    = 0;
+    std::uint64_t kv_ram_captures     = 0;
+    std::uint64_t kv_ram_restores     = 0;
+    std::uint64_t kv_ram_evictions    = 0;
+    std::uint64_t kv_ram_drops        = 0;
 };
 
 struct GenerationOutcome {

@@ -191,5 +191,69 @@ int main() {
     failures += expect_size(pinned.size(), 128, "pinned.size");
     std::memset(pinned.data(), 0x5a, pinned.size());
 
+    {
+        ninfer::HostPinnedArena host(1024);
+        failures += expect_size(host.capacity(), 1024, "host arena capacity");
+        failures += expect_size(host.used(), 0, "host arena used initial");
+        if (host.base() == nullptr) {
+            ++failures;
+            std::cerr << "host arena base is null\n";
+        }
+        void* first = host.try_alloc(64, 256);
+        if (first == nullptr || first != host.base() ||
+            reinterpret_cast<std::uintptr_t>(first) % 256 != 0) {
+            ++failures;
+            std::cerr << "first host allocation is misaligned or null\n";
+        }
+        failures += expect_size(host.used(), 64, "host arena used after first");
+        void* second = host.try_alloc(32, 256);
+        if (second == nullptr || reinterpret_cast<std::uintptr_t>(second) % 256 != 0 ||
+            static_cast<unsigned char*>(second) < static_cast<unsigned char*>(first) + 64) {
+            ++failures;
+            std::cerr << "second host allocation is not 256-aligned after the first block\n";
+        }
+        failures += expect_size(host.used(), 96, "host arena used after second");
+        host.free(first);
+        failures += expect_size(host.used(), 32, "host arena used after free first");
+        void* reuse = host.try_alloc(64, 256);
+        failures += expect_ptr(reuse, first, "first-fit reused the leading hole");
+        host.free(reuse);
+        host.free(second);
+        failures += expect_size(host.used(), 0, "host arena used after coalesced free");
+        void* whole = host.try_alloc(1024, 256);
+        if (whole == nullptr) {
+            ++failures;
+            std::cerr << "coalesced host arena could not satisfy a full-capacity alloc\n";
+        }
+        host.free(whole);
+
+        void* a = host.try_alloc(256, 256);
+        void* b = host.try_alloc(256, 256);
+        void* c = host.try_alloc(256, 256);
+        if (a == nullptr || b == nullptr || c == nullptr) {
+            ++failures;
+            std::cerr << "three 256-byte host allocations failed\n";
+        } else {
+            host.free(b);
+            failures += expect_size(host.used(), 512, "host used with middle hole");
+            if (host.try_alloc(384, 256) != nullptr) {
+                ++failures;
+                std::cerr << "first-fit allocated across a pinned middle hole\n";
+            }
+            host.free(a);
+            host.free(c);
+            if (host.try_alloc(768, 256) == nullptr) {
+                ++failures;
+                std::cerr << "coalesced host arena failed to absorb the middle hole\n";
+            } else {
+                host.free(host.base());
+            }
+        }
+        if (host.try_alloc(2048, 256) != nullptr) {
+            ++failures;
+            std::cerr << "host arena allocated more than its capacity\n";
+        }
+    }
+
     return failures == 0 ? 0 : fail("arena test failed");
 }

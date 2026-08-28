@@ -137,6 +137,7 @@ measured recommendation rather than a semantic limit.
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
+| `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
@@ -206,6 +207,16 @@ request transient, and CUDA Graph allowance, while leaving the default 1 GiB aut
 unallocated. It does not probe allocations or resize the pool at request time. The single-request
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
+`--kv-ram-capacity N` is a separate pinned-host budget in MiB for completed prefix bundles. It is
+not a token capacity, does not enlarge the GPU pool, and defaults to `off`. `N` must be a positive
+decimal integer; `0` is rejected. Construction fails if the host pin cannot be allocated.
+Host RAM is an exclusive FIFO: a bundle lives in VRAM or in this budget, not both. CLI and serve
+human logs print this budget and live host-resident occupancy in MiB (`used`/`entries` exclude a
+chat after consume following a restore onto a KV lane; a later spill recaptures it as a new FIFO
+tail). Exact byte values remain on the Engine API and in the JSONL request log; set
+`NINFER_KV_RAM_LOG_BYTES=1` to print those same byte counts on the human lines. A new capture may
+still need to reap or evict while logged `used` looks low, because a just-consumed copy can occupy
+the pin until its CUDA event completes.
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
 Program scratch arena, the maximum Vision request-transient buffer when Vision is enabled, and a

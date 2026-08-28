@@ -2,6 +2,7 @@
 #include "serve/translate.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -199,6 +200,12 @@ int main() {
                       "serve help omits media preparation controls");
     failures += check(serve_usage_text("ninfer-serve").find("--kv-capacity") != std::string::npos,
                       "serve help omits --kv-capacity");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--kv-ram-capacity") != std::string::npos,
+              "serve help omits --kv-ram-capacity");
+    failures += check(serve_usage_text("ninfer-serve").find("pinned host KV prefix-cache capacity in MiB") !=
+                          std::string::npos,
+                      "serve help omits KV RAM MiB wording");
     failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
                           std::string::npos,
                       "serve help omits Responses store limits");
@@ -218,6 +225,30 @@ int main() {
                           automatic.kv_capacity.automatic_headroom_bytes ==
                               ninfer::kDefaultKvCapacityHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
+
+    const ServeOptions ram_off = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(ram_off.kv_ram_capacity_bytes == 0,
+                      "omitted --kv-ram-capacity did not default off");
+    const ServeOptions ram_explicit_off =
+        parse({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "off"});
+    failures += check(ram_explicit_off.kv_ram_capacity_bytes == 0,
+                      "--kv-ram-capacity off did not disable the tier");
+    const ServeOptions ram_mib =
+        parse({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "1"});
+    failures += check(ram_mib.kv_ram_capacity_bytes == 1024ULL * 1024ULL,
+                      "--kv-ram-capacity 1 did not convert MiB to bytes");
+    auto reject_ram = [&](const char* value, const char* message) {
+        bool rejected = false;
+        try {
+            parse({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", value});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, message);
+    };
+    reject_ram("0", "--kv-ram-capacity 0 was accepted");
+    reject_ram("1.5", "--kv-ram-capacity float was accepted");
+    reject_ram("", "--kv-ram-capacity empty was accepted");
+    reject_ram("auto", "--kv-ram-capacity non-decimal was accepted");
+    reject_ram("17592186044416", "--kv-ram-capacity overflow was accepted");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});

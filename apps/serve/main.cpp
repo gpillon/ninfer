@@ -2,6 +2,7 @@
 #include "serve/console_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
+#include "serve/request_log.h"
 #include "serve/serve_options.h"
 #include "serve/webui_update.h"
 
@@ -103,7 +104,8 @@ int main(int argc, char** argv) {
                  << " headroom=" << format_bytes(memory.kv_capacity_headroom_bytes)
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
                  << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
-                 << format_bytes(memory.cuda_graph_allowance_bytes);
+                 << format_bytes(memory.cuda_graph_allowance_bytes)
+                 << " kv-ram=" << ninfer::serve::format_kv_ram_occupancy(memory);
         if (options.enable_vision) {
             const ninfer::MediaCacheSummary media = service.media_cache_summary();
             capacity << " media-workers=" << media.preprocess_threads
@@ -114,6 +116,12 @@ int main(int argc, char** argv) {
 
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "warming up...");
         service.warmup();
+        const ninfer::MemorySummary warmed = service.memory_summary();
+        if (warmed.kv_ram_capacity_bytes != 0) {
+            std::ostringstream ram;
+            ram << "kv-ram=" << ninfer::serve::format_kv_ram_occupancy(warmed);
+            ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, ram.str());
+        }
 
         g_server.store(&server);
         std::signal(SIGINT, handle_signal);

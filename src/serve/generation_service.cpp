@@ -230,6 +230,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.device                   = options_.device;
     engine_options.max_context              = options_.max_context;
     engine_options.kv_capacity              = options_.kv_capacity;
+    engine_options.kv_ram_capacity_bytes    = options_.kv_ram_capacity_bytes;
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
@@ -394,6 +395,16 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
+    outcome.metrics.prefix_reuse_source         = result.prefix_reuse_source;
+    const ninfer::MemorySummary memory          = engine_->memory_summary();
+    const ninfer::RuntimeStats stats            = engine_->runtime_stats();
+    outcome.metrics.kv_ram_capacity_bytes       = memory.kv_ram_capacity_bytes;
+    outcome.metrics.kv_ram_used_bytes           = memory.kv_ram_used_bytes;
+    outcome.metrics.kv_ram_entry_count          = memory.kv_ram_entry_count;
+    outcome.metrics.kv_ram_captures             = stats.kv_ram_captures;
+    outcome.metrics.kv_ram_restores             = stats.kv_ram_restores;
+    outcome.metrics.kv_ram_evictions            = stats.kv_ram_evictions;
+    outcome.metrics.kv_ram_drops                = stats.kv_ram_drops;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;

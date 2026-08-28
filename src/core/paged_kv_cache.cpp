@@ -20,10 +20,14 @@ std::int32_t checked_i32(std::uint32_t value, const char* label) {
     return static_cast<std::int32_t>(value);
 }
 
+} // namespace
+
 std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
     if (tokens == 0) { return 0; }
     return 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
+
+namespace {
 
 void validate_distinct_pools(std::span<const PagedKVReservation> reservations) {
     for (std::size_t i = 0; i < reservations.size(); ++i) {
@@ -125,6 +129,8 @@ std::uint32_t PagedKVPool::logical_page_capacity() const noexcept {
 std::int32_t PagedKVPool::table_row_count() const noexcept { return spec_.table_rows; }
 
 std::size_t PagedKVPool::plane_count() const noexcept { return planes_.size(); }
+
+PagedKVPlaneOrder PagedKVPool::plane_order() const noexcept { return spec_.plane_order; }
 
 const Tensor& PagedKVPool::plane(std::size_t index) const { return planes_.at(index); }
 
@@ -465,6 +471,179 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes) {
     for (const PagedKVResize& change : changes) {
         change.allocation->trim_pages(change.mapped_pages);
         change.allocation->set_page_entitlement(change.page_entitlement);
+    }
+}
+
+namespace {
+
+std::size_t plane_page_bytes(const Tensor& plane, PagedKVPlaneOrder order) {
+    if (order == PagedKVPlaneOrder::PageMajor) {
+        if (plane.nb[3] <= 0) {
+            throw std::logic_error("Paged KV PageMajor plane has invalid page stride");
+        }
+        return static_cast<std::size_t>(plane.nb[3]);
+    }
+    if (plane.ne[3] <= 0 || plane.nb[2] <= 0) {
+        throw std::logic_error("Paged KV HeadMajor plane has invalid page geometry");
+    }
+    return static_cast<std::size_t>(plane.ne[3]) * static_cast<std::size_t>(plane.nb[2]);
+}
+
+void pack_page_major_pages(unsigned char* out, unsigned char* base, std::int64_t page_stride,
+                           std::size_t bpp, std::span<const std::int32_t> pages,
+                           cudaStream_t stream) {
+    std::size_t begin = 0;
+    while (begin < pages.size()) {
+        if (begin + 1 >= pages.size()) {
+            CUDA_CHECK(cudaMemcpyAsync(out + begin * bpp,
+                                       base + static_cast<std::int64_t>(pages[begin]) * page_stride,
+                                       bpp, cudaMemcpyDeviceToHost, stream));
+            break;
+        }
+        const std::int32_t delta = pages[begin + 1] - pages[begin];
+        if (delta <= 0) {
+            CUDA_CHECK(cudaMemcpyAsync(out + begin * bpp,
+                                       base + static_cast<std::int64_t>(pages[begin]) * page_stride,
+                                       bpp, cudaMemcpyDeviceToHost, stream));
+            ++begin;
+            continue;
+        }
+        std::size_t end = begin + 1;
+        while (end + 1 < pages.size() && pages[end + 1] - pages[end] == delta) { ++end; }
+        const std::size_t count = end - begin + 1;
+        if (delta == 1) {
+            CUDA_CHECK(cudaMemcpyAsync(out + begin * bpp,
+                                       base + static_cast<std::int64_t>(pages[begin]) * page_stride,
+                                       count * bpp, cudaMemcpyDeviceToHost, stream));
+        } else {
+            const std::size_t pitch =
+                static_cast<std::size_t>(delta) * static_cast<std::size_t>(page_stride);
+            CUDA_CHECK(cudaMemcpy2DAsync(out + begin * bpp, bpp,
+                                         base + static_cast<std::int64_t>(pages[begin]) * page_stride,
+                                         pitch, bpp, count, cudaMemcpyDeviceToHost, stream));
+        }
+        begin = end + 1;
+    }
+}
+
+void unpack_page_major_pages(unsigned char* base, std::int64_t page_stride, std::size_t bpp,
+                             const unsigned char* in, std::span<const std::int32_t> pages,
+                             std::uint32_t dst_extent, cudaStream_t stream) {
+    std::size_t begin = 0;
+    while (begin < dst_extent) {
+        if (begin + 1 >= dst_extent) {
+            CUDA_CHECK(cudaMemcpyAsync(base + static_cast<std::int64_t>(pages[begin]) * page_stride,
+                                       in + begin * bpp, bpp, cudaMemcpyHostToDevice, stream));
+            break;
+        }
+        const std::int32_t delta = pages[begin + 1] - pages[begin];
+        if (delta <= 0) {
+            CUDA_CHECK(cudaMemcpyAsync(base + static_cast<std::int64_t>(pages[begin]) * page_stride,
+                                       in + begin * bpp, bpp, cudaMemcpyHostToDevice, stream));
+            ++begin;
+            continue;
+        }
+        std::size_t end = begin + 1;
+        while (end + 1 < dst_extent && pages[end + 1] - pages[end] == delta) { ++end; }
+        const std::size_t count = end - begin + 1;
+        if (delta == 1) {
+            CUDA_CHECK(cudaMemcpyAsync(base + static_cast<std::int64_t>(pages[begin]) * page_stride,
+                                       in + begin * bpp, count * bpp, cudaMemcpyHostToDevice,
+                                       stream));
+        } else {
+            const std::size_t pitch =
+                static_cast<std::size_t>(delta) * static_cast<std::size_t>(page_stride);
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                base + static_cast<std::int64_t>(pages[begin]) * page_stride, pitch,
+                in + begin * bpp, bpp, bpp, count, cudaMemcpyHostToDevice, stream));
+        }
+        begin = end + 1;
+    }
+}
+
+} // namespace
+
+std::size_t paged_kv_host_image_bytes(const PagedKVPool& pool, std::uint32_t page_count) {
+    std::size_t total              = 0;
+    const PagedKVPlaneOrder order  = pool.plane_order();
+    for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+        const std::size_t bpp = plane_page_bytes(pool.plane(index), order);
+        if (page_count != 0 && bpp > std::numeric_limits<std::size_t>::max() / page_count) {
+            throw std::overflow_error("Paged KV host image exceeds size_t");
+        }
+        const std::size_t plane_bytes = bpp * static_cast<std::size_t>(page_count);
+        if (total > std::numeric_limits<std::size_t>::max() - plane_bytes) {
+            throw std::overflow_error("Paged KV host image exceeds size_t");
+        }
+        total += plane_bytes;
+    }
+    return total;
+}
+
+void pack_paged_kv_allocation_to_host(const PagedKVAllocation& allocation, const PagedKVPool& pool,
+                                      void* dst, cudaStream_t stream) {
+    if (!allocation.valid() || !allocation.belongs_to(pool)) {
+        throw std::invalid_argument("Paged KV pack requires an allocation from the named pool");
+    }
+    if (dst == nullptr && allocation.mapped_page_count() != 0) {
+        throw std::invalid_argument("Paged KV pack destination is null");
+    }
+    const std::span<const std::int32_t> pages = allocation.page_ids();
+    const PagedKVPlaneOrder order             = pool.plane_order();
+    auto* out                                 = static_cast<unsigned char*>(dst);
+    for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
+        const Tensor& plane       = pool.plane(plane_index);
+        const std::size_t bpp     = plane_page_bytes(plane, order);
+        auto* base                = static_cast<unsigned char*>(plane.data);
+        if (order == PagedKVPlaneOrder::PageMajor) {
+            pack_page_major_pages(out, base, plane.nb[3], bpp, pages, stream);
+        } else {
+            for (std::size_t i = 0; i < pages.size(); ++i) {
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    out + i * bpp, static_cast<std::size_t>(plane.nb[2]),
+                    base + static_cast<std::int64_t>(pages[i]) * plane.nb[2],
+                    static_cast<std::size_t>(plane.nb[3]), static_cast<std::size_t>(plane.nb[2]),
+                    static_cast<std::size_t>(plane.ne[3]), cudaMemcpyDeviceToHost, stream));
+            }
+        }
+        out += pages.size() * bpp;
+    }
+}
+
+void unpack_paged_kv_allocation_from_host(PagedKVAllocation& allocation, const PagedKVPool& pool,
+                                          const void* src, std::uint32_t src_page_count,
+                                          std::uint32_t dst_extent, cudaStream_t stream) {
+    if (!allocation.valid() || !allocation.belongs_to(pool)) {
+        throw std::invalid_argument("Paged KV unpack requires an allocation from the named pool");
+    }
+    if (dst_extent > src_page_count) {
+        throw std::logic_error("Paged KV unpack extent exceeds the captured image");
+    }
+    if (dst_extent > allocation.mapped_page_count()) {
+        throw std::logic_error("Paged KV unpack extent exceeds mapped destination pages");
+    }
+    if (src == nullptr && dst_extent != 0) {
+        throw std::invalid_argument("Paged KV unpack source is null");
+    }
+    const std::span<const std::int32_t> pages = allocation.page_ids();
+    const PagedKVPlaneOrder order             = pool.plane_order();
+    const auto* in = static_cast<const unsigned char*>(src);
+    for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
+        const Tensor& plane   = pool.plane(plane_index);
+        const std::size_t bpp = plane_page_bytes(plane, order);
+        auto* base            = static_cast<unsigned char*>(plane.data);
+        if (order == PagedKVPlaneOrder::PageMajor) {
+            unpack_page_major_pages(base, plane.nb[3], bpp, in, pages, dst_extent, stream);
+        } else {
+            for (std::uint32_t i = 0; i < dst_extent; ++i) {
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    base + static_cast<std::int64_t>(pages[i]) * plane.nb[2],
+                    static_cast<std::size_t>(plane.nb[3]), in + static_cast<std::size_t>(i) * bpp,
+                    static_cast<std::size_t>(plane.nb[2]), static_cast<std::size_t>(plane.nb[2]),
+                    static_cast<std::size_t>(plane.ne[3]), cudaMemcpyHostToDevice, stream));
+            }
+        }
+        in += static_cast<std::size_t>(src_page_count) * bpp;
     }
 }
 

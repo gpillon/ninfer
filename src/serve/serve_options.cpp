@@ -60,12 +60,29 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     return KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(value));
 }
 
+std::size_t parse_kv_ram_capacity_bytes(const char* text) {
+    if (text == nullptr || std::string_view(text) == "off") { return 0; }
+    const std::uint64_t mib = parse_u64(text, "kv-ram-capacity");
+    if (mib == 0) {
+        throw std::invalid_argument("--kv-ram-capacity must be off or a positive MiB integer");
+    }
+    constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
+    if (mib > std::numeric_limits<std::uint64_t>::max() / kMiB) {
+        throw std::invalid_argument("--kv-ram-capacity overflows 64-bit bytes");
+    }
+    const std::uint64_t bytes = mib * kMiB;
+    if (bytes > std::numeric_limits<std::size_t>::max()) {
+        throw std::invalid_argument("--kv-ram-capacity overflows size_t");
+    }
+    return static_cast<std::size_t>(bytes);
+}
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
+           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--kv-ram-capacity off|N] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
@@ -97,6 +114,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
+           "       --kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default off)\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
@@ -152,6 +170,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--kv-ram-capacity") {
+            options.kv_ram_capacity_bytes =
+                parse_kv_ram_capacity_bytes(require_value("--kv-ram-capacity"));
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));

@@ -122,4 +122,51 @@ void CyclicKVCache::copy_lane_from(const CyclicKVCache& source, std::int32_t lan
     }
 }
 
+std::size_t CyclicKVCache::lane_host_bytes() const noexcept {
+    if (k_.empty()) { return 0; }
+    const Tensor k_lane = k_[0].slice(3, 0, 1);
+    const Tensor v_lane = v_[0].slice(3, 0, 1);
+    return static_cast<std::size_t>(layer_count()) * (k_lane.bytes() + v_lane.bytes());
+}
+
+void CyclicKVCache::copy_lane_to_host(std::int32_t lane, void* dst, cudaStream_t stream) const {
+    if (lane < 0 || lane >= lane_capacity_) {
+        throw std::out_of_range("Cyclic KV lane is out of range");
+    }
+    if (dst == nullptr && lane_host_bytes() != 0) {
+        throw std::invalid_argument("Cyclic KV host pack destination is null");
+    }
+    auto* out = static_cast<unsigned char*>(dst);
+    for (std::size_t layer = 0; layer < k_.size(); ++layer) {
+        Tensor source_k = k_[layer].slice(3, lane, 1);
+        Tensor source_v = v_[layer].slice(3, lane, 1);
+        CUDA_CHECK(cudaMemcpyAsync(out, source_k.data, source_k.bytes(), cudaMemcpyDeviceToHost,
+                                   stream));
+        out += source_k.bytes();
+        CUDA_CHECK(cudaMemcpyAsync(out, source_v.data, source_v.bytes(), cudaMemcpyDeviceToHost,
+                                   stream));
+        out += source_v.bytes();
+    }
+}
+
+void CyclicKVCache::copy_lane_from_host(const void* src, std::int32_t lane, cudaStream_t stream) {
+    if (lane < 0 || lane >= lane_capacity_) {
+        throw std::out_of_range("Cyclic KV lane is out of range");
+    }
+    if (src == nullptr && lane_host_bytes() != 0) {
+        throw std::invalid_argument("Cyclic KV host unpack source is null");
+    }
+    auto* in = static_cast<const unsigned char*>(src);
+    for (std::size_t layer = 0; layer < k_.size(); ++layer) {
+        Tensor destination_k = k_[layer].slice(3, lane, 1);
+        Tensor destination_v = v_[layer].slice(3, lane, 1);
+        CUDA_CHECK(cudaMemcpyAsync(destination_k.data, in, destination_k.bytes(),
+                                   cudaMemcpyHostToDevice, stream));
+        in += destination_k.bytes();
+        CUDA_CHECK(cudaMemcpyAsync(destination_v.data, in, destination_v.bytes(),
+                                   cudaMemcpyHostToDevice, stream));
+        in += destination_v.bytes();
+    }
+}
+
 } // namespace ninfer

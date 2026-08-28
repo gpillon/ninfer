@@ -56,12 +56,15 @@ struct RequestPlanSummary {
     std::size_t transient_alignment       = 1;
     AdmissionResources admission;
     std::uint64_t service_work_quanta = 0;
+    std::uint64_t ram_entry_id        = 0;
+    PrefixReuseSource reuse_source    = PrefixReuseSource::None;
 };
 
 struct BeginSummary {
-    std::uint32_t prompt_tokens        = 0;
-    std::uint32_t reused_prompt_tokens = 0;
-    PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+    std::uint32_t prompt_tokens           = 0;
+    std::uint32_t reused_prompt_tokens    = 0;
+    PrefixReusePath prefix_reuse_path     = PrefixReusePath::FullReset;
+    PrefixReuseSource prefix_reuse_source = PrefixReuseSource::None;
 };
 
 struct GeneratedRound {

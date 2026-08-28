@@ -21,6 +21,7 @@ struct Options {
     std::uint32_t max_new        = 128;
     std::uint32_t max_context    = 2048;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
+    std::size_t kv_ram_capacity_bytes = 0;
     std::uint32_t prefill_chunk  = 1024;
     int device                   = 0;
 

@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iomanip>
 #include <iostream>
@@ -52,6 +53,24 @@ std::string format_bytes(std::uint64_t bytes) {
         output << static_cast<double>(bytes) / kKiB << " KiB";
     } else {
         output << bytes << " B";
+    }
+    return output.str();
+}
+
+bool kv_ram_log_exact_bytes() {
+    const char* text = std::getenv("NINFER_KV_RAM_LOG_BYTES");
+    return text != nullptr && text[0] != '\0' && text[0] != '0';
+}
+
+std::string format_kv_ram_size(std::uint64_t bytes) {
+    if (kv_ram_log_exact_bytes()) { return std::to_string(bytes) + " B"; }
+    constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
+    std::ostringstream output;
+    if (bytes % kMiB == 0) {
+        output << (bytes / kMiB) << " MiB";
+    } else {
+        output << std::fixed << std::setprecision(1)
+               << static_cast<double>(bytes) / static_cast<double>(kMiB) << " MiB";
     }
     return output.str();
 }
@@ -158,7 +177,8 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
 
 void print_generation_summary(const ninfer::GenerationResult& result,
                               const ninfer::ResolvedSamplingParameters& sampling,
-                              const ninfer::MemorySummary& memory) {
+                              const ninfer::MemorySummary& memory,
+                              const ninfer::RuntimeStats& stats) {
     print_stage("prepare", "render/preprocess", result.timings.prepare_seconds);
     print_stage("generate", "vision", result.timings.vision_seconds);
     print_stage("generate", "text prefill", result.timings.prefill_seconds);
@@ -209,6 +229,18 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     }());
     if (memory.rope_note != nullptr) { print_metric("rope note", memory.rope_note); }
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
+    print_metric("KV RAM capacity", memory.kv_ram_capacity_bytes == 0
+                                        ? "off"
+                                        : format_kv_ram_size(memory.kv_ram_capacity_bytes));
+    print_metric("KV RAM used", memory.kv_ram_capacity_bytes == 0
+                                    ? "off"
+                                    : format_kv_ram_size(memory.kv_ram_used_bytes) + " / " +
+                                          std::to_string(memory.kv_ram_entry_count) + " entries");
+    print_metric("KV RAM events",
+                 "captures=" + std::to_string(stats.kv_ram_captures) +
+                     " restores=" + std::to_string(stats.kv_ram_restores) +
+                     " evicts=" + std::to_string(stats.kv_ram_evictions) +
+                     " drops=" + std::to_string(stats.kv_ram_drops));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
     print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));
@@ -281,6 +313,7 @@ int main(int argc, char** argv) {
         engine_options.device         = cli.device;
         engine_options.max_context    = cli.max_context;
         engine_options.kv_capacity    = cli.kv_capacity;
+        engine_options.kv_ram_capacity_bytes = cli.kv_ram_capacity_bytes;
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache            = cli.kv_cache;
         engine_options.rope_scaling_factor      = cli.rope_scaling.factor;
@@ -314,7 +347,8 @@ int main(int argc, char** argv) {
             }
             std::cerr << '\n';
         }
-        print_generation_summary(result, sampling, engine.memory_summary());
+        print_generation_summary(result, sampling, engine.memory_summary(),
+                                 engine.runtime_stats());
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';

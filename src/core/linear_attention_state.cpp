@@ -223,4 +223,75 @@ void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream)
     }
 }
 
+std::size_t LinearAttentionStatePool::conv_slot_bytes() const noexcept {
+    return Tensor(nullptr, spec.conv_dtype, {spec.conv_channels, spec.conv_width}).bytes();
+}
+
+std::size_t LinearAttentionStatePool::recurrent_slot_bytes() const noexcept {
+    return Tensor(nullptr, DType::FP32,
+                  {spec.key_head_dim, spec.value_head_dim, spec.value_heads})
+        .bytes();
+}
+
+std::size_t LinearAttentionStatePool::conv_host_image_bytes() const noexcept {
+    return static_cast<std::size_t>(layer_count()) * conv_slot_bytes();
+}
+
+std::size_t LinearAttentionStatePool::recurrent_host_image_bytes() const noexcept {
+    return static_cast<std::size_t>(layer_count()) * recurrent_slot_bytes();
+}
+
+void LinearAttentionStatePool::pack_slot_to_host(std::int32_t slot, void* conv_dst,
+                                                 void* recurrent_dst, cudaStream_t stream) const {
+    validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool pack_slot_to_host");
+    if ((conv_dst == nullptr && conv_host_image_bytes() != 0) ||
+        (recurrent_dst == nullptr && recurrent_host_image_bytes() != 0)) {
+        throw std::invalid_argument("LinearAttentionStatePool host pack destination is null");
+    }
+    const std::uint32_t layers     = layer_count();
+    const std::size_t conv_bytes   = conv_slot_bytes();
+    const std::size_t rec_bytes    = recurrent_slot_bytes();
+    if (layers == 1) {
+        CUDA_CHECK(cudaMemcpyAsync(conv_dst, conv_slot(0, slot).data, conv_bytes,
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(recurrent_dst, recurrent_slot(0, slot).data, rec_bytes,
+                                   cudaMemcpyDeviceToHost, stream));
+        return;
+    }
+    const std::size_t conv_pitch = static_cast<std::size_t>(layer_stride_bytes(conv, "conv"));
+    const std::size_t rec_pitch =
+        static_cast<std::size_t>(layer_stride_bytes(recurrent, "recurrent"));
+    CUDA_CHECK(cudaMemcpy2DAsync(conv_dst, conv_bytes, conv_slot(0, slot).data, conv_pitch,
+                                 conv_bytes, layers, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(recurrent_dst, rec_bytes, recurrent_slot(0, slot).data, rec_pitch,
+                                 rec_bytes, layers, cudaMemcpyDeviceToHost, stream));
+}
+
+void LinearAttentionStatePool::unpack_slot_from_host(std::int32_t slot, const void* conv_src,
+                                                     const void* recurrent_src,
+                                                     cudaStream_t stream) {
+    validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool unpack_slot_from_host");
+    if ((conv_src == nullptr && conv_host_image_bytes() != 0) ||
+        (recurrent_src == nullptr && recurrent_host_image_bytes() != 0)) {
+        throw std::invalid_argument("LinearAttentionStatePool host unpack source is null");
+    }
+    const std::uint32_t layers   = layer_count();
+    const std::size_t conv_bytes = conv_slot_bytes();
+    const std::size_t rec_bytes  = recurrent_slot_bytes();
+    if (layers == 1) {
+        CUDA_CHECK(cudaMemcpyAsync(conv_slot(0, slot).data, conv_src, conv_bytes,
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(recurrent_slot(0, slot).data, recurrent_src, rec_bytes,
+                                   cudaMemcpyHostToDevice, stream));
+        return;
+    }
+    const std::size_t conv_pitch = static_cast<std::size_t>(layer_stride_bytes(conv, "conv"));
+    const std::size_t rec_pitch =
+        static_cast<std::size_t>(layer_stride_bytes(recurrent, "recurrent"));
+    CUDA_CHECK(cudaMemcpy2DAsync(conv_slot(0, slot).data, conv_pitch, conv_src, conv_bytes,
+                                 conv_bytes, layers, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(recurrent_slot(0, slot).data, rec_pitch, recurrent_src, rec_bytes,
+                                 rec_bytes, layers, cudaMemcpyHostToDevice, stream));
+}
+
 } // namespace ninfer

@@ -66,8 +66,12 @@ public:
 
     [[nodiscard]] CyclicKVCacheLayerView layer_view(std::uint32_t layer) const;
 
+    [[nodiscard]] std::size_t lane_host_bytes() const noexcept;
+
     // Copies one lane's complete fixed state. Source and destination must have identical layouts.
     void copy_lane_from(const CyclicKVCache& source, std::int32_t lane, cudaStream_t stream);
+    void copy_lane_to_host(std::int32_t lane, void* dst, cudaStream_t stream) const;
+    void copy_lane_from_host(const void* src, std::int32_t lane, cudaStream_t stream);
 
 private:
     std::vector<Tensor> k_;

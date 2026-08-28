@@ -103,6 +103,8 @@ struct PagedKVPoolLayout {
 [[nodiscard]] PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder,
                                                    const PagedKVPoolSpec& spec);
 
+[[nodiscard]] std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept;
+
 class PagedKVAllocation;
 struct PagedKVResize;
 
@@ -119,6 +121,7 @@ public:
     [[nodiscard]] std::uint32_t logical_page_capacity() const noexcept;
     [[nodiscard]] std::int32_t table_row_count() const noexcept;
     [[nodiscard]] std::size_t plane_count() const noexcept;
+    [[nodiscard]] PagedKVPlaneOrder plane_order() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
     [[nodiscard]] const Tensor& block_tables() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
@@ -218,5 +221,15 @@ struct PagedKVResize {
 
 // Atomically validates a retained-claim/truncate resize vector, then applies it at a GPU boundary.
 void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
+
+[[nodiscard]] std::size_t paged_kv_host_image_bytes(const PagedKVPool& pool,
+                                                    std::uint32_t page_count);
+
+void pack_paged_kv_allocation_to_host(const PagedKVAllocation& allocation, const PagedKVPool& pool,
+                                      void* dst, cudaStream_t stream);
+
+void unpack_paged_kv_allocation_from_host(PagedKVAllocation& allocation, const PagedKVPool& pool,
+                                          const void* src, std::uint32_t src_page_count,
+                                          std::uint32_t dst_extent, cudaStream_t stream);
 
 } // namespace ninfer

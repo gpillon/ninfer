@@ -271,4 +271,113 @@ void* PinnedHostBuffer::data() const noexcept { return data_; }
 
 std::size_t PinnedHostBuffer::size() const noexcept { return size_; }
 
+HostPinnedArena::HostPinnedArena(std::size_t capacity_bytes) {
+    if (capacity_bytes == 0) {
+        throw std::invalid_argument("HostPinnedArena capacity must be nonzero");
+    }
+    void* ptr             = nullptr;
+    const cudaError_t err = cudaHostAlloc(&ptr, capacity_bytes, cudaHostAllocDefault);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaHostAlloc failed", err));
+    }
+    base_ = ptr;
+    cap_  = capacity_bytes;
+    free_.push_back(FreeSpan{0, capacity_bytes});
+}
+
+HostPinnedArena::~HostPinnedArena() { free_pinned(base_); }
+
+HostPinnedArena::HostPinnedArena(HostPinnedArena&& other) noexcept
+    : base_(other.base_), cap_(other.cap_), used_(other.used_), free_(std::move(other.free_)),
+      live_(std::move(other.live_)) {
+    other.base_ = nullptr;
+    other.cap_  = 0;
+    other.used_ = 0;
+}
+
+HostPinnedArena& HostPinnedArena::operator=(HostPinnedArena&& other) noexcept {
+    if (this == &other) { return *this; }
+    free_pinned(base_);
+    base_       = other.base_;
+    cap_        = other.cap_;
+    used_       = other.used_;
+    free_       = std::move(other.free_);
+    live_       = std::move(other.live_);
+    other.base_ = nullptr;
+    other.cap_  = 0;
+    other.used_ = 0;
+    return *this;
+}
+
+void* HostPinnedArena::try_alloc(std::size_t bytes, std::size_t align) {
+    if (base_ == nullptr) { throw std::runtime_error("HostPinnedArena has no backing allocation"); }
+    if (!is_power_of_two(align)) {
+        throw std::invalid_argument("arena alignment must be a nonzero power of two");
+    }
+    if (bytes == 0) { throw std::invalid_argument("arena allocation must be nonzero"); }
+    if (bytes > cap_) { return nullptr; }
+
+    const std::uintptr_t base_addr = reinterpret_cast<std::uintptr_t>(base_);
+    for (std::size_t index = 0; index < free_.size(); ++index) {
+        const FreeSpan span              = free_[index];
+        const std::uintptr_t span_addr   = checked_add_uintptr(base_addr, span.offset);
+        const std::uintptr_t aligned_addr = align_up_addr(span_addr, align);
+        const std::uintptr_t lead_addr    = aligned_addr - span_addr;
+        if (lead_addr > std::numeric_limits<std::size_t>::max()) { continue; }
+        const auto lead = static_cast<std::size_t>(lead_addr);
+        if (lead > span.size || bytes > span.size - lead) { continue; }
+
+        const std::size_t alloc_offset = span.offset + lead;
+        const std::size_t tail         = span.size - lead - bytes;
+        free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(index));
+        if (tail != 0) { insert_free(alloc_offset + bytes, tail); }
+        if (lead != 0) { insert_free(span.offset, lead); }
+
+        void* ptr         = static_cast<unsigned char*>(base_) + alloc_offset;
+        live_[ptr]        = LiveBlock{alloc_offset, bytes};
+        used_            += bytes;
+        return ptr;
+    }
+    return nullptr;
+}
+
+void HostPinnedArena::free(void* block) {
+    if (block == nullptr) { throw std::invalid_argument("HostPinnedArena free of null"); }
+    const auto it = live_.find(block);
+    if (it == live_.end()) { throw std::logic_error("HostPinnedArena free of unknown block"); }
+    const LiveBlock live = it->second;
+    live_.erase(it);
+    used_ -= live.size;
+    insert_free(live.offset, live.size);
+}
+
+void* HostPinnedArena::base() const noexcept { return base_; }
+
+std::size_t HostPinnedArena::capacity() const noexcept { return cap_; }
+
+std::size_t HostPinnedArena::used() const noexcept { return used_; }
+
+void HostPinnedArena::insert_free(std::size_t offset, std::size_t size) {
+    if (size == 0) { return; }
+    auto it = free_.begin();
+    while (it != free_.end() && it->offset < offset) { ++it; }
+    if (it != free_.begin()) {
+        auto prev = it - 1;
+        if (prev->offset + prev->size == offset) {
+            prev->size += size;
+            if (it != free_.end() && prev->offset + prev->size == it->offset) {
+                prev->size += it->size;
+                free_.erase(it);
+            }
+            return;
+        }
+    }
+    if (it != free_.end() && offset + size == it->offset) {
+        it->offset = offset;
+        it->size  += size;
+        return;
+    }
+    free_.insert(it, FreeSpan{offset, size});
+}
+
 } // namespace ninfer

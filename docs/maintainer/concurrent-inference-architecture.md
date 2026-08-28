@@ -23,12 +23,12 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 - Text 与 image/video prompt；
 - ordinary decoding 与 engine-wide speculative decoding；
 - streaming 与 non-streaming output；
-- prefix reuse；
+- prefix reuse, plus an optional completed-bundle pinned-host RAM second tier;
 - 不同 prompt length、context length、generation limit 和 sampling configuration。
 
 ### 1.2 Non-goals
 
-- request preemption、swap 或 pause/resume；
+- request preemption、swap、pause/resume，或把 **active** request 的 KV 迁出 GPU；
 - 多请求 batched prefill 或 prefill/decode mixed forward；
 - 多 GPU 或 distributed inference；
 - priority、tenant QoS 或 deadline-aware GPU scheduling；
@@ -734,12 +734,53 @@ limit 和 output state 始终由新 request 创建。
 
 Retained state 占用实际 state-pool memory，但不占 active control slot，也不保留 future growth
 reservation。Active admission 优先；cache occupancy 阻塞原本可行的 request 前，先驱逐 free lanes 上的
-retained entries。Planner 不复制或迁移 retained physical state，而是在 free lanes 中选择最大合法 reuse。
-只有在 slot/lane 和完整 entitlement 都已满足后才能 claim cache ownership。
+retained entries。VRAM retained physical state 仍留在原 lane，Planner 在 free lanes 中选择最大合法
+reuse，不在 GPU 上复制或迁移 page mapping。An optional host-RAM second tier snapshots a completed
+bundle into pinned host memory at the admission site that is about to destroy it. A later hit
+restores the full SequenceState onto the chosen free lane and then uses the same prefix-reuse
+decision. Cache ownership is claimed only after the slot/lane and the full entitlement are already
+satisfied.
 
 Prefix lookup 只改变 uncached prompt work 和 prospective reuse plan，不自行授予 queue priority。它可以保守地
 缩短 §5.5 的 service projection，但仍须通过相同 protected-head qualification；无论是否命中，最终 active
 request 都进入相同 prefill/decode schedule 和 compact batch formation。
+
+### 6.5 Host RAM second tier
+
+`--kv-ram-capacity` enables a startup-fixed pinned-host budget that stores **already completed**
+prefix bundles only. The default is `off`. It does not change GPU pool capacity, active-set
+accounting, or CUDA Graph addresses, and it does not move an in-flight request off the GPU.
+
+The host tier is an exclusive FIFO of chats that are not on a VRAM lane. A new capture appends at
+the tail. Capacity pressure evicts the oldest unpinned host entry until the new image fits; if it
+still cannot, `drops` increments and the incoming request proceeds while the VRAM bundle is
+released. Host RAM is not a precondition for admission.
+
+The executor captures at each admission site that is about to destroy a retained bundle, not inside
+`clear_lane` / `evict_retained_lane` / abort / destructor:
+
+1. other free-lane retained entries the eviction loop is about to release;
+2. a selected VRAM `FullReset` plan whose target lane is still retained (the usual
+   `max_concurrency=1` load path);
+3. a RAM restore that is about to cover a still-dirty target lane.
+
+That capture is a fresh D2H of the current prefix and becomes the new FIFO tail. A later RAM hit
+exclusive-claims the matching host entry (pinned entries are invisible to later `plan_match`).
+`capture` and `unpack` record a CUDA event after the copies so CPU prefill setup can overlap
+restore H2D. Consume happens after the first non-throwing `start_prefill_lane`, including an
+incomplete first chunk: it erases that entry wherever it sits in the FIFO and retires the host
+block; a throw before consume releases the claim and leaves the host row in place. After consume
+the bundle lives only in VRAM until a later spill recaptures it. Occupancy `used`/`entries` count
+those live host residents, including a claimed-but-not-consumed pin, and exclude retired copy
+blocks that still occupy the pin until reap. A later capture may still reap or evict while logged
+`used` looks low.
+
+The planner picks the larger `reusable_prompt_tokens` between VRAM and RAM; equal reuse keeps
+VRAM. VRAM `FullReset` and RAM restore both prefer a free lane with no retained bundle and cover a
+dirty lane only when no empty lane is feasible. The admitted `RequestPlan` is the winner: RAM pass
+1 keeps `evict_retained=false` even if the target lane is dirty, and restore captures that lane's
+old bundle. `GenerationResult` uses `prefix_reuse_source` for `none` / `vram_resident` /
+`host_ram`; `prefix_reuse_path` still describes only frontier/checkpoint semantics.
 
 ---
 

@@ -118,6 +118,7 @@ int main() {
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
+    failures += check(kRequestLogSchemaVersion == 10, "request-log schema is not version 10");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
@@ -143,6 +144,23 @@ int main() {
         check(server.at("engine").at("proposal_head") == "optimized", "proposal head missing");
     failures +=
         check(server.at("engine").at("prefix_reuse") == false, "prefix-reuse state missing");
+    failures += check(server.at("engine").at("kv_ram_capacity_bytes") == 0,
+                      "KV RAM capacity missing from server_start engine object");
+    failures += check(server.at("engine").at("kv_ram_used_bytes") == 0 &&
+                          server.at("engine").at("kv_ram_entry_count") == 0,
+                      "KV RAM occupancy missing from server_start engine object");
+    failures += check(server.at("memory").at("kv_ram_capacity_bytes") == 0,
+                      "KV RAM capacity missing from server_start memory object");
+    memory.kv_ram_capacity_bytes = 2ULL * 1024ULL * 1024ULL;
+    memory.kv_ram_used_bytes     = 1024ULL * 1024ULL;
+    memory.kv_ram_entry_count    = 3;
+    const Json ram_server = Json::parse(
+        format_server_start_json("serve-test", 1001, options, sampling_defaults, "deployment-alias",
+                                 load, memory, environment, std::uint64_t{123456}));
+    failures += check(ram_server.at("engine").at("kv_ram_capacity_bytes") == 2097152 &&
+                          ram_server.at("memory").at("kv_ram_used_bytes") == 1048576 &&
+                          ram_server.at("memory").at("kv_ram_entry_count") == 3,
+                      "enabled KV RAM occupancy missing from server_start");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
     failures +=
@@ -280,6 +298,36 @@ int main() {
                       "computed prefill tokens missing");
     failures += check(done.at("result").at("prefix_reuse_path") == "restore_turn_checkpoint",
                       "prefix reuse path missing");
+    failures += check(done.at("result").at("reuse_source") == "none",
+                      "reuse_source missing from request_done");
+    outcome.metrics.prefix_reuse_source = ninfer::PrefixReuseSource::HostRam;
+    const Json ram_hit =
+        Json::parse(format_request_done_json("serve-test", 3002, context, outcome));
+    failures += check(ram_hit.at("result").at("reuse_source") == "host_ram",
+                      "host_ram reuse_source missing");
+    outcome.metrics.prefix_reuse_source = ninfer::PrefixReuseSource::VramResident;
+    const Json vram_hit =
+        Json::parse(format_request_done_json("serve-test", 3003, context, outcome));
+    failures += check(vram_hit.at("result").at("reuse_source") == "vram_resident",
+                      "vram_resident reuse_source missing");
+    outcome.metrics.kv_ram_capacity_bytes = 1024ULL * 1024ULL;
+    outcome.metrics.kv_ram_used_bytes     = 512ULL * 1024ULL;
+    outcome.metrics.kv_ram_entry_count    = 1;
+    outcome.metrics.kv_ram_captures       = 4;
+    outcome.metrics.kv_ram_restores       = 2;
+    outcome.metrics.kv_ram_drops          = 1;
+    const Json ram_done =
+        Json::parse(format_request_done_json("serve-test", 3004, context, outcome));
+    failures += check(ram_done.at("result").at("kv_ram_capacity_bytes") == 1048576 &&
+                          ram_done.at("result").at("kv_ram_used_bytes") == 524288 &&
+                          ram_done.at("result").at("kv_ram_entry_count") == 1 &&
+                          ram_done.at("result").at("kv_ram_captures") == 4 &&
+                          ram_done.at("result").at("kv_ram_drops") == 1,
+                      "request_done JSON omitted live KV RAM occupancy");
+    failures += check(format_request_done(context, outcome).find("kv-ram=1 MiB used=0.5 MiB entries=1") !=
+                              std::string::npos &&
+                          format_request_done(context, outcome).find("ram_drops=1") != std::string::npos,
+                      "human request log omits KV RAM occupancy when the tier is enabled");
     outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestoreResponseCheckpoint;
     const Json response_restore =
         Json::parse(format_request_done_json("serve-test", 3001, context, outcome));
@@ -318,6 +366,9 @@ int main() {
         check(format_request_done(context, outcome).find("reuse=restore_response_checkpoint") !=
                   std::string::npos,
               "human request log omits response checkpoint reuse path");
+    failures += check(format_request_done(context, outcome).find("reuse_source=vram_resident") !=
+                          std::string::npos,
+                      "human request log omits reuse_source");
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
 
@@ -334,8 +385,37 @@ int main() {
     const std::string human_throughput         = format_throughput(throughput);
     failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
                           human_throughput.find("decode=20.0tok/s") != std::string::npos &&
-                          human_throughput.find("avg_decode_batch=1.80") != std::string::npos,
+                          human_throughput.find("avg_decode_batch=1.80") != std::string::npos &&
+                          human_throughput.find("ram_captures=") == std::string::npos &&
+                          human_throughput.find("kv-ram=") == std::string::npos,
                       "human throughput report mismatch");
+    failures += check(format_kv_ram_size(1024ULL * 1024ULL, false) == "1 MiB" &&
+                          format_kv_ram_size(1024ULL * 1024ULL, true) == "1048576 B" &&
+                          format_kv_ram_size(1536ULL * 1024ULL, false) == "1.5 MiB",
+                      "KV RAM human size is not MiB by default with exact bytes available");
+    ninfer::MemorySummary ram_off;
+    failures += check(format_kv_ram_occupancy(ram_off) == "off",
+                      "disabled KV RAM occupancy is not off");
+    ThroughputReport ram_throughput = throughput;
+    ram_throughput.kv_ram_capacity_bytes = 1024ULL * 1024ULL;
+    ram_throughput.kv_ram_used_bytes     = 512ULL * 1024ULL;
+    ram_throughput.kv_ram_entry_count    = 2;
+    ram_throughput.scheduler.kv_ram_captures = 3;
+    ram_throughput.scheduler.kv_ram_restores = 1;
+    const std::string human_ram_throughput   = format_throughput(ram_throughput);
+    failures += check(human_ram_throughput.find("kv-ram=1 MiB used=0.5 MiB entries=2") !=
+                              std::string::npos &&
+                          human_ram_throughput.find("ram_captures=3") != std::string::npos &&
+                          human_ram_throughput.find("ram_restores=1") != std::string::npos,
+                      "enabled KV RAM occupancy missing from human throughput");
+    const Json ram_throughput_json =
+        Json::parse(format_throughput_json("serve-test", 5001, ram_throughput));
+    failures += check(ram_throughput_json.at("scheduler").at("kv_ram_capacity_bytes") == 1048576 &&
+                          ram_throughput_json.at("scheduler").at("kv_ram_used_bytes") == 524288 &&
+                          ram_throughput_json.at("scheduler").at("kv_ram_entry_count") == 2 &&
+                          ram_throughput_json.at("scheduler").at("kv_ram_captures") == 3 &&
+                          ram_throughput_json.at("scheduler").at("kv_ram_restores") == 1,
+                      "enabled KV RAM occupancy missing from throughput JSON");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
@@ -344,6 +424,14 @@ int main() {
                       "throughput token deltas mismatch");
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
+    failures += check(throughput_json.at("scheduler").at("kv_ram_captures") == 0 &&
+                          throughput_json.at("scheduler").at("kv_ram_restores") == 0 &&
+                          throughput_json.at("scheduler").at("kv_ram_evictions") == 0 &&
+                          throughput_json.at("scheduler").at("kv_ram_drops") == 0 &&
+                          throughput_json.at("scheduler").at("kv_ram_capacity_bytes") == 0 &&
+                          throughput_json.at("scheduler").at("kv_ram_used_bytes") == 0 &&
+                          throughput_json.at("scheduler").at("kv_ram_entry_count") == 0,
+                      "throughput scheduler RAM counters missing");
 
     const std::string console_prefix =
         format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);

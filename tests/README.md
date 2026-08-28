@@ -109,11 +109,25 @@ artifact. The 35B-A3B reference binding test follows the same rule with
 target tests still run without either artifact.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
-runs the real engine:
+runs the real engine. The RAM-tier test covers capture sites 1–3, INT8 KV, MTP, oversize drop,
+VRAM-wins-equal-reuse, longer-RAM-beats-shorter-VRAM, suffix prefill after RAM restore, RAM disabled, queued matcher,
+`allow_prefix_reuse=false`, rewrite-checkpoint restore, dirty-lane checkpoint restore, cancel-after-consume, consume-then-VRAM,
+overlapping `submit()` at `max_concurrency=2`, C=2/C=3 sequential FullReset onto an empty lane
+keeping earlier chats in VRAM (exact resume, new message, and a later dirty-lane cover), exclusive
+FIFO occupancy (RAM hit drops the restored chat from `used`/`entries`; later spill recaptures it),
+one-entry spill drop of a dirty-lane occupant, Engine teardown after a RAM restore,
+and the C=3 shared-pool analog (three 3-page chats, two 4-page continuations plus RAM suffix restore of the third, 2-page fits-now backfill, blocked 4-page tail, exact vs suffix reuse). `ninfer_admission_policy_test` locks the same 10-page leftover-2 / leftover-0 / no-lane arithmetic. `ninfer_kv_ram_cache_perf_test` and
+`ninfer_kv_ram_cache_opt_test` check host pack/unpack bandwidth against pinned memcpy, event
+overlapped restore, fragmented vs contiguous PageMajor runs, and GDN/hidden RAM round-trips.
+`ninfer_kv_ram_cache_large_test` moves a 27B-shaped GDN slot (~147 MiB) and a 64-plane ~100 MiB INT8 KV image both ways, including a two-slot GDN plus KV restore:
 
 ```bash
 NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_ram_real_test --output-on-failure
+NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_ram_real_test --output-on-failure
 ```
 
 Run the peer 35B-A3B route independently:

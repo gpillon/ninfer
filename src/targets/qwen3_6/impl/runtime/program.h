@@ -9,6 +9,7 @@
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
@@ -86,6 +87,8 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    PrefixReuseSource reuse_source            = PrefixReuseSource::None;
+    std::uint64_t ram_entry_id                = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -194,6 +197,7 @@ struct RequestControl {
         double elapsed_seconds           = 0.0;
         bool prepare_mtp                 = false;
         ReusePath reuse                  = ReusePath::FullReset;
+        PrefixReuseSource reuse_source   = PrefixReuseSource::None;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
     };
 
@@ -212,6 +216,8 @@ public:
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
                                                     const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base);
+    [[nodiscard]] RequestPlan plan_ram_reuse(const PreparedPromptData& prompt,
+                                             const RequestBasePlan& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
@@ -234,6 +240,13 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint32_t retained_frontier_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
+    void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
+    void claim_ram_entry(std::uint64_t entry_id);
+    void release_ram_entry(std::uint64_t entry_id);
+    void consume_ram_entry(std::uint64_t entry_id);
+    [[nodiscard]] qwen3_6::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
+    [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -260,6 +273,7 @@ public:
     const bool vision_enabled;
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
+    const std::size_t kv_ram_capacity_bytes;
     const std::size_t graph_allowance_bytes;
     std::size_t graph_observed_bytes = 0;
     const WorkspacePlan workspace_plan;
@@ -297,6 +311,7 @@ public:
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
+    std::optional<qwen3_6::detail::KVRamCache> kv_ram_cache_;
 
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
@@ -341,6 +356,24 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
+
+    struct ResidentStateView {
+        const std::vector<TokenId>* ledger                    = nullptr;
+        const qwen3_6::detail::ResidentPrefixIdentity* identity = nullptr;
+        std::uint32_t execution_frontier                      = 0;
+        RewriteCheckpoint rewrite_checkpoint;
+        std::uint32_t text_kv_valid           = 0;
+        std::uint32_t mtp_kv_valid            = 0;
+        std::uint32_t dflash_context_frontier = 0;
+        bool tail_hidden_valid                = false;
+        bool backend_image_present            = false;
+    };
+
+    void apply_reuse_decision(RequestPlanImpl& plan, const ResidentStateView& view,
+                              const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
+    void finish_request_plan(RequestPlanImpl& plan, const ResidentStateView* view,
+                             const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
+    [[nodiscard]] qwen3_6::detail::RamCaptureSource ram_capture_source(const SequenceState& sequence);
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

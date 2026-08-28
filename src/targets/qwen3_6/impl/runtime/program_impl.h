@@ -191,6 +191,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      kv_ram_capacity_bytes(plan.kv_ram_capacity_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
@@ -311,6 +312,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+    if (kv_ram_capacity_bytes != 0) { kv_ram_cache_.emplace(kv_ram_capacity_bytes); }
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
@@ -625,22 +627,25 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 if (!used[i]) { prompt.media_payloads[i].reset(); }
             }
         }
-        if (prompt.has_media() && !request_plan.vision) { prompt.release_all_media_payloads(); }
+        const bool host_input_consumed = prompt.has_media() && !request_plan.vision;
+        if (host_input_consumed) { prompt.release_all_media_payloads(); }
 
         RequestControl::Prefill prefill{
-            .prompt                     = std::move(prompt),
-            .vision_plan                = std::move(request_plan.vision),
-            .vision                     = nullptr,
-            .transient                  = transient,
-            .rewrite_checkpoint_capture = request_plan.rewrite_checkpoint_capture,
-            .base                       = base,
-            .cursor                     = base,
-            .prompt_tokens              = prompt_tokens,
-            .initial_mtp_extent         = initial_mtp_extent,
-            .elapsed_seconds            = 0.0,
-            .prepare_mtp                = request_plan.prepare_mtp,
-            .reuse                      = request_plan.reuse,
-            .mtp_bridge                 = request_plan.mtp_bridge,
+            .prompt                      = std::move(prompt),
+            .vision_plan                 = std::move(request_plan.vision),
+            .vision                      = nullptr,
+            .transient                   = transient,
+            .rewrite_checkpoint_capture  = request_plan.rewrite_checkpoint_capture,
+            .base                        = base,
+            .cursor                      = base,
+            .prompt_tokens               = prompt_tokens,
+            .initial_mtp_extent          = initial_mtp_extent,
+            .elapsed_seconds             = 0.0,
+            .host_input_consumed_pending = host_input_consumed,
+            .prepare_mtp                 = request_plan.prepare_mtp,
+            .reuse                       = request_plan.reuse,
+            .reuse_source                = request_plan.reuse_source,
+            .mtp_bridge                  = request_plan.mtp_bridge,
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -904,6 +909,171 @@ std::uint32_t ProgramImplCore::retained_frontier_lane(std::uint32_t lane) const 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
     clear_lane(sequences[lane], requests[lane]);
+}
+
+qwen3_6::detail::RamCaptureSource
+ProgramImplCore::ram_capture_source(const SequenceState& sequence) {
+    if (!sequence.kv || !sequence.retained) {
+        throw std::logic_error("RAM capture requires a retained sequence bundle");
+    }
+    qwen3_6::detail::RamCaptureSource source;
+    source.execution_frontier      = sequence.execution_frontier;
+    source.ledger_frontier         = sequence.ledger_frontier;
+    source.rope_delta              = sequence.rope_delta;
+    source.text_kv_valid           = sequence.text_kv_valid;
+    source.mtp_kv_valid            = sequence.mtp_kv_valid;
+    source.dflash_context_frontier = sequence.dflash_context_frontier;
+    source.tail_hidden_valid       = sequence.tail_hidden_valid;
+    source.rewrite_valid           = sequence.rewrite_checkpoint.valid;
+    source.rewrite_kind            = sequence.rewrite_checkpoint.kind;
+    source.rewrite_frontier        = sequence.rewrite_checkpoint.frontier;
+    source.ledger                  = sequence.ledger;
+    source.identity                = &sequence.prefix_identity;
+    source.hash_f =
+        qwen3_6::detail::prefix_hash_at(sequence.ledger, sequence.prefix_identity,
+                                        sequence.execution_frontier);
+    if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0) {
+        source.hash_c = qwen3_6::detail::prefix_hash_at(
+            sequence.ledger, sequence.prefix_identity, sequence.rewrite_checkpoint.frontier);
+        source.hash_c_valid = true;
+    }
+    source.text      = &sequence.kv->text;
+    source.text_pool = &decoder->text_kv.pool();
+    if (sequence.kv->backend) {
+        source.backend      = &*sequence.kv->backend;
+        source.backend_pool = &backend_kv_cache()->pool();
+    }
+    source.gdn                 = &decoder->linear_attention;
+    source.gdn_current_slot    = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+    source.gdn_checkpoint_slot =
+        LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency);
+    source.tail_hidden = &sequence.tail_hidden;
+    if (sequence.rewrite_checkpoint.valid) {
+        source.rewrite_checkpoint_hidden = &sequence.rewrite_checkpoint_hidden;
+    }
+    if (dflash) {
+        source.dflash_local = &dflash->local;
+        if (sequence.rewrite_checkpoint.valid) {
+            source.dflash_checkpoint = &dflash->rewrite_checkpoint_local;
+        }
+        source.dflash_lane = static_cast<std::int32_t>(sequence.lane);
+    }
+    source.stream = device.stream;
+    return source;
+}
+
+bool ProgramImplCore::capture_retained_lane(std::uint32_t lane) {
+    if (!kv_ram_cache_ || !has_retained_lane(lane)) { return true; }
+    return kv_ram_cache_->capture(ram_capture_source(sequences[lane]));
+}
+
+void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,
+                                        const RequestPlan& plan) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    if (!kv_ram_cache_) { throw std::logic_error("RAM restore requires an enabled RAM tier"); }
+    if (plan.impl_ == nullptr) { throw std::invalid_argument("request plan is empty"); }
+    const RequestPlanImpl& request_plan = *plan.impl_;
+    if (request_plan.reuse == ReusePath::FullReset || request_plan.ram_entry_id != entry_id ||
+        request_plan.reuse_source != PrefixReuseSource::HostRam || request_plan.reuse_base == 0) {
+        throw std::logic_error("RAM restore requires a winning host-RAM reuse plan");
+    }
+    SequenceState& sequence = sequences[lane];
+    RequestControl& request = requests[lane];
+    if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
+        request.lifecycle == Lifecycle::Pending) {
+        throw std::logic_error("RAM restore requires a free request lane");
+    }
+    try {
+        if (has_retained_lane(lane)) { (void)capture_retained_lane(lane); }
+        sequence.kv.reset();
+        sequence.retained           = false;
+        sequence.mtp_draft_count    = 0;
+        sequence.rewrite_checkpoint = {};
+
+        reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
+                            request_plan.backend_kv_page_entitlement);
+        const std::uint32_t text_pages = ninfer::pages_for_tokens(request_plan.reuse_base);
+        std::uint32_t backend_pages    = 0;
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            backend_pages = ninfer::pages_for_tokens(
+                request_plan.reuse_base == 0 ? 0U : request_plan.reuse_base - 1U);
+        } else if (speculative_backend == SpeculativeBackend::DFlash) {
+            backend_pages = ninfer::pages_for_tokens(request_plan.reuse_base);
+        }
+        sequence.kv->text.materialize_pages(text_pages, device.stream);
+        if (sequence.kv->backend) {
+            sequence.kv->backend->materialize_pages(backend_pages, device.stream);
+        }
+
+        qwen3_6::detail::RamRestoreTarget target;
+        target.text_dst_pages    = text_pages;
+        target.backend_dst_pages = backend_pages;
+        target.text              = &sequence.kv->text;
+        target.text_pool         = &decoder->text_kv.pool();
+        if (sequence.kv->backend) {
+            target.backend      = &*sequence.kv->backend;
+            target.backend_pool = &backend_kv_cache()->pool();
+        }
+        target.gdn                 = &decoder->linear_attention;
+        target.gdn_current_slot    = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+        target.gdn_checkpoint_slot =
+            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency);
+        target.tail_hidden               = &sequence.tail_hidden;
+        target.rewrite_checkpoint_hidden = &sequence.rewrite_checkpoint_hidden;
+        if (dflash) {
+            target.dflash_local      = &dflash->local;
+            target.dflash_checkpoint = &dflash->rewrite_checkpoint_local;
+            target.dflash_lane       = static_cast<std::int32_t>(sequence.lane);
+        }
+        target.stream = device.stream;
+
+        qwen3_6::detail::RamRestoredHost host = kv_ram_cache_->unpack_device(entry_id, target);
+        sequence.execution_frontier      = host.execution_frontier;
+        sequence.ledger_frontier         = host.ledger_frontier;
+        sequence.rope_delta              = host.rope_delta;
+        sequence.text_kv_valid           = host.text_kv_valid;
+        sequence.mtp_kv_valid            = host.mtp_kv_valid;
+        sequence.dflash_context_frontier = host.dflash_context_frontier;
+        sequence.tail_hidden_valid       = host.tail_hidden_valid;
+        sequence.rewrite_checkpoint      = RewriteCheckpoint{
+            .valid    = host.rewrite_valid,
+            .kind     = host.rewrite_kind,
+            .frontier = host.rewrite_frontier,
+        };
+        sequence.ledger          = std::move(host.ledger);
+        sequence.prefix_identity = std::move(host.identity);
+        sequence.mtp_draft_count = 0;
+        sequence.retained        = true;
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        clear_lane(sequence, request);
+        throw;
+    }
+}
+
+void ProgramImplCore::claim_ram_entry(std::uint64_t entry_id) {
+    if (!kv_ram_cache_) { throw std::logic_error("RAM claim requires an enabled RAM tier"); }
+    kv_ram_cache_->claim(entry_id);
+}
+
+void ProgramImplCore::release_ram_entry(std::uint64_t entry_id) {
+    if (!kv_ram_cache_) { throw std::logic_error("RAM release requires an enabled RAM tier"); }
+    kv_ram_cache_->release(entry_id);
+}
+
+void ProgramImplCore::consume_ram_entry(std::uint64_t entry_id) {
+    if (!kv_ram_cache_) { throw std::logic_error("RAM consume requires an enabled RAM tier"); }
+    kv_ram_cache_->consume(entry_id);
+}
+
+qwen3_6::detail::KvRamSnapshot ProgramImplCore::kv_ram_snapshot() const noexcept {
+    return kv_ram_cache_ ? kv_ram_cache_->snapshot() : qwen3_6::detail::KvRamSnapshot{};
+}
+
+std::uint64_t ProgramImplCore::kv_ram_index_version() const noexcept {
+    return kv_ram_cache_ ? kv_ram_cache_->index_version() : 0;
 }
 
 GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
@@ -1564,9 +1734,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     }
 
     RequestControl::Prefill& staged = *request.prefill;
-    const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
-                                        .reused_prompt_tokens = staged.base,
-                                        .prefix_reuse_path    = staged.reuse};
+    const runtime::BeginSummary summary{.prompt_tokens         = staged.prompt_tokens,
+                                        .reused_prompt_tokens  = staged.base,
+                                        .prefix_reuse_path     = staged.reuse,
+                                        .prefix_reuse_source   = staged.reuse_source};
+    bool host_input_consumed              = staged.host_input_consumed_pending;
+    staged.host_input_consumed_pending    = false;
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
@@ -2283,6 +2456,11 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
+    const qwen3_6::detail::KvRamSnapshot ram =
+        kv_ram_cache_ ? kv_ram_cache_->snapshot() : qwen3_6::detail::KvRamSnapshot{};
+    out.kv_ram_capacity_bytes = ram.capacity_bytes;
+    out.kv_ram_used_bytes     = ram.used_bytes;
+    out.kv_ram_entry_count    = ram.entry_count;
     return out;
 }
 

@@ -211,6 +211,11 @@ private:
             ++snapshot.running_requests;
             if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
         }
+        const auto ram            = instance_.program->kv_ram_snapshot();
+        snapshot.kv_ram_captures  = ram.captures;
+        snapshot.kv_ram_restores  = ram.restores;
+        snapshot.kv_ram_evictions = ram.evictions;
+        snapshot.kv_ram_drops     = ram.drops;
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
     }
@@ -298,6 +303,8 @@ private:
         std::optional<BasePlan> base_plan;
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
         std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions{};
+        std::optional<Plan> ram_plan;
+        std::uint64_t ram_index_version = 0;
         AdmissionResources admission_resources;
         std::uint64_t remaining_service_work = 0;
         std::uint64_t backfill_epoch         = 0;
@@ -345,8 +352,9 @@ private:
     };
 
     struct LaneChoice {
-        std::uint32_t lane  = 0;
-        bool evict_retained = false;
+        std::uint32_t lane      = 0;
+        bool evict_retained     = false;
+        std::uint64_t ram_entry_id = 0;
     };
 
     void append_output(const std::shared_ptr<Request>& request,
@@ -403,6 +411,8 @@ private:
     void release_planning_state(const std::shared_ptr<Request>& request) noexcept {
         request->base_plan.reset();
         for (auto& plan : request->lane_plans) { plan.reset(); }
+        request->ram_plan.reset();
+        request->ram_index_version = 0;
     }
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
@@ -430,8 +440,9 @@ private:
         result.finish_reason           = reason;
         result.timings.prepare_seconds = request->prepare_seconds;
         if (request->begin) {
-            result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
-            result.prefix_reuse_path    = request->begin->prefix_reuse_path;
+            result.reused_prompt_tokens   = request->begin->reused_prompt_tokens;
+            result.prefix_reuse_path      = request->begin->prefix_reuse_path;
+            result.prefix_reuse_source    = request->begin->prefix_reuse_source;
         }
         if (request->lane) {
             result.timings = instance_.program->generation_timings_lane(*request->lane);
@@ -717,47 +728,77 @@ private:
         request->lane_plan_versions[lane] = lane_plan_versions_[lane];
     }
 
+    void ensure_ram_candidate(const std::shared_ptr<Request>& request) {
+        if (!request->options.execution.allow_prefix_reuse) {
+            request->ram_plan.reset();
+            return;
+        }
+        const std::uint64_t version = instance_.program->kv_ram_index_version();
+        if (request->ram_index_version == version) { return; }
+        request->ram_plan.reset();
+        Plan plan =
+            instance_.program->plan_ram_reuse(request->prompt, *request->base_plan);
+        if (plan.summary().reusable_prompt_tokens > 0 &&
+            plan.summary().ram_entry_id != 0 &&
+            plan.summary().reuse_source == PrefixReuseSource::HostRam) {
+            request->ram_plan.emplace(std::move(plan));
+        }
+        request->ram_index_version = version;
+    }
+
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
+        ensure_ram_candidate(request);
+        const Plan* ram_plan = request->ram_plan ? &*request->ram_plan : nullptr;
+        const std::uint32_t ram_reuse =
+            ram_plan != nullptr ? ram_plan->summary().reusable_prompt_tokens : 0U;
+        const std::uint64_t ram_entry_id =
+            ram_plan != nullptr ? ram_plan->summary().ram_entry_id : 0ULL;
+
+        auto first_ram_lane = [&](bool after_eviction) -> std::optional<std::uint32_t> {
+            std::optional<std::uint32_t> dirty;
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (slots_[lane] != nullptr) { continue; }
+                const bool feasible =
+                    after_eviction
+                        ? instance_.program->can_admit_lane_after_retained_eviction(lane, *ram_plan)
+                        : instance_.program->can_admit_lane(lane, *ram_plan);
+                if (!feasible) { continue; }
+                if (!instance_.program->has_retained_lane(lane)) { return lane; }
+                if (!dirty) { dirty = lane; }
+            }
+            return dirty;
+        };
+
         std::optional<LaneChoice> selected;
-        std::uint32_t selected_reuse             = 0;
-        bool selected_has_retained               = false;
-        std::uint32_t selected_retained_frontier = 0;
-        // Selection priority:
-        //
-        // 1. largest reusable prefix
-        // 2. on equal reuse, prefer a truly empty lane
-        // 3. if all candidates contain retained state, sacrifice the
-        //    smallest retained sequence first
-        //
-        // This protects long-lived agent contexts from unrelated short
-        // classifier/helper requests.
+        std::uint32_t selected_reuse = 0;
+        bool selected_dirty          = false;
+        auto consider_vram           = [&](std::uint32_t lane, std::uint32_t reuse, bool evict) {
+            const bool dirty = instance_.program->has_retained_lane(lane);
+            if (selected && reuse < selected_reuse) { return; }
+            if (selected && reuse == selected_reuse && (!selected_dirty || dirty)) { return; }
+            selected       = LaneChoice{.lane = lane, .evict_retained = evict, .ram_entry_id = 0};
+            selected_reuse = reuse;
+            selected_dirty = dirty;
+        };
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-            const bool has_retained =
-                instance_.program->has_retained_lane(lane);
-            const std::uint32_t retained_frontier =
-                has_retained
-                    ? instance_.program->retained_frontier_lane(lane)
-                    : 0;
-            const bool better =
-                !selected ||
-                reuse > selected_reuse ||
-                (reuse == selected_reuse &&
-                 selected_has_retained &&
-                 !has_retained) ||
-                (reuse == selected_reuse &&
-                 selected_has_retained &&
-                 has_retained &&
-                 retained_frontier < selected_retained_frontier);
-            if (instance_.program->can_admit_lane(lane, plan) && better) {
-                selected                    = LaneChoice{.lane = lane};
-                selected_reuse              = reuse;
-                selected_has_retained       = has_retained;
-                selected_retained_frontier  = retained_frontier;
+            if (instance_.program->can_admit_lane(lane, plan)) {
+                consider_vram(lane, reuse, false);
+            }
+        }
+        if (ram_plan != nullptr && ram_reuse > 0) {
+            if (const std::optional<std::uint32_t> ram_lane = first_ram_lane(false); ram_lane) {
+                if (!selected || ram_reuse > selected_reuse) {
+                    selected = LaneChoice{.lane           = *ram_lane,
+                                          .evict_retained = false,
+                                          .ram_entry_id   = ram_entry_id};
+                    selected_reuse = ram_reuse;
+                    selected_dirty = instance_.program->has_retained_lane(*ram_lane);
+                }
             }
         }
         if (selected) { return selected; }
@@ -765,39 +806,24 @@ private:
         // No lane can admit directly. Retry allowing retained eviction.
         //
         selected.reset();
-        selected_reuse             = 0;
-        selected_has_retained      = false;
-        selected_retained_frontier = 0;
+        selected_reuse = 0;
+        selected_dirty = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-            const bool has_retained =
-                instance_.program->has_retained_lane(lane);
-            const std::uint32_t retained_frontier =
-                has_retained
-                    ? instance_.program->retained_frontier_lane(lane)
-                    : 0;
-            const bool better =
-                !selected ||
-                reuse > selected_reuse ||
-                (reuse == selected_reuse &&
-                 selected_has_retained &&
-                 !has_retained) ||
-                (reuse == selected_reuse &&
-                 selected_has_retained &&
-                 has_retained &&
-                 retained_frontier < selected_retained_frontier);
-            if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
-                better) {
-                selected = LaneChoice{
-                    .lane           = lane,
-                    .evict_retained = true,
-                };
-                selected_reuse             = reuse;
-                selected_has_retained      = has_retained;
-                selected_retained_frontier = retained_frontier;
+            if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan)) {
+                consider_vram(lane, reuse, true);
+            }
+        }
+        if (ram_plan != nullptr && ram_reuse > 0) {
+            if (const std::optional<std::uint32_t> ram_lane = first_ram_lane(true); ram_lane) {
+                if (!selected || ram_reuse > selected_reuse) {
+                    selected = LaneChoice{.lane           = *ram_lane,
+                                          .evict_retained = true,
+                                          .ram_entry_id   = ram_entry_id};
+                }
             }
         }
         return selected;
@@ -831,43 +857,78 @@ private:
         }
 
         const std::uint32_t lane = choice.lane;
-        if (!request->lane_plans[lane]) {
+        const bool ram_hit       = choice.ram_entry_id != 0;
+        if (ram_hit) {
+            if (!request->ram_plan ||
+                request->ram_plan->summary().ram_entry_id != choice.ram_entry_id) {
+                throw std::logic_error("selected RAM admission has no matching request plan");
+            }
+        } else if (!request->lane_plans[lane]) {
             throw std::logic_error("selected admission lane has no request plan");
         }
-        if (choice.evict_retained) {
-            for (std::uint32_t retained_lane = 0;
-                 retained_lane < max_concurrency_ &&
-                 !instance_.program->can_admit_lane(lane, *request->lane_plans[lane]);
-                 ++retained_lane) {
-                if (retained_lane != lane && slots_[retained_lane] == nullptr &&
-                    instance_.program->has_retained_lane(retained_lane)) {
-                    instance_.program->evict_retained_lane(retained_lane);
-                    invalidate_lane_plans(retained_lane);
+        Plan& winning_plan = ram_hit ? *request->ram_plan : *request->lane_plans[lane];
+
+        bool ram_claimed   = false;
+        bool ram_consumed  = false;
+        bool target_started = false;
+        if (ram_hit) {
+            instance_.program->claim_ram_entry(choice.ram_entry_id);
+            ram_claimed = true;
+        }
+
+        auto release_ram_if_needed = [&]() {
+            if (ram_claimed && !ram_consumed) {
+                instance_.program->release_ram_entry(choice.ram_entry_id);
+                ram_claimed = false;
+            }
+        };
+
+        try {
+            if (choice.evict_retained) {
+                for (std::uint32_t retained_lane = 0;
+                     retained_lane < max_concurrency_ &&
+                     !instance_.program->can_admit_lane(lane, winning_plan);
+                     ++retained_lane) {
+                    if (retained_lane != lane && slots_[retained_lane] == nullptr &&
+                        instance_.program->has_retained_lane(retained_lane)) {
+                        (void)instance_.program->capture_retained_lane(retained_lane);
+                        instance_.program->evict_retained_lane(retained_lane);
+                        invalidate_lane_plans(retained_lane);
+                    }
+                }
+                if (!instance_.program->can_admit_lane(lane, winning_plan)) {
+                    throw std::logic_error("retained eviction did not make admission feasible");
                 }
             }
-            if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
-                throw std::logic_error("retained eviction did not make admission feasible");
+
+            if (!ram_hit && winning_plan.summary().reusable_prompt_tokens == 0 &&
+                instance_.program->has_retained_lane(lane)) {
+                (void)instance_.program->capture_retained_lane(lane);
             }
-        }
 
-        Plan selected_plan = std::move(*request->lane_plans[lane]);
-        request->lane_plans[lane].reset();
-        if (!erase_pending(request)) { return AdmissionProgress::None; }
-        release_planning_state(request);
-
-        const RequestPlanSummary summary = selected_plan.summary();
-        if (backfill_class == BackfillClass::Temporal) {
-            if (!protection_ || protection_->epoch_id != backfill_epoch ||
-                summary.service_work_quanta > protection_->temporal_credit) {
-                throw std::logic_error("temporal backfill lost its protected credit");
+            Plan selected_plan = std::move(winning_plan);
+            if (ram_hit) {
+                request->ram_plan.reset();
+            } else {
+                request->lane_plans[lane].reset();
             }
-            protection_->temporal_credit -= summary.service_work_quanta;
-        }
-        clear_protection_if_head(request);
+            if (!erase_pending(request)) {
+                release_ram_if_needed();
+                return AdmissionProgress::None;
+            }
+            release_planning_state(request);
 
-        const bool needs_prefill = summary.reusable_prompt_tokens < summary.prompt_tokens;
-        bool target_started      = false;
-        try {
+            const RequestPlanSummary summary = selected_plan.summary();
+            if (backfill_class == BackfillClass::Temporal) {
+                if (!protection_ || protection_->epoch_id != backfill_epoch ||
+                    summary.service_work_quanta > protection_->temporal_credit) {
+                    throw std::logic_error("temporal backfill lost its protected credit");
+                }
+                protection_->temporal_credit -= summary.service_work_quanta;
+            }
+            clear_protection_if_head(request);
+
+            const bool needs_prefill = summary.reusable_prompt_tokens < summary.prompt_tokens;
             request->budget.emplace(summary.effective_output_tokens,
                                     summary.effective_limit_reason);
             request->generated.reserve(summary.effective_output_tokens);
@@ -887,17 +948,26 @@ private:
                 transient     = instance_.request_memory.region();
             }
             publish_runtime_stats();
-            target_started                = true;
+            if (ram_hit) {
+                instance_.program->restore_ram_entry(lane, choice.ram_entry_id, selected_plan);
+            }
+            target_started = true;
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient);
+            if (ram_hit) {
+                instance_.program->consume_ram_entry(choice.ram_entry_id);
+                ram_consumed = true;
+            }
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             resolve_prefill_step(request, first, cancel_at_boundary);
             publish_runtime_stats();
+            return AdmissionProgress::RanGpuUnit;
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
+            release_ram_if_needed();
             if (target_started) { instance_.program->abort_lane(lane); }
             if (prefill_lane_ && *prefill_lane_ == lane) {
                 instance_.request_memory.deactivate();
@@ -910,7 +980,6 @@ private:
             // fail_all the engine over one request's host-side error (the req-3 class).
             return AdmissionProgress::ControlProgress;
         }
-        return AdmissionProgress::RanGpuUnit;
     }
 
     AdmissionProgress try_admit_one() {
@@ -1037,7 +1106,8 @@ private:
                 }
                 if (!candidate_lane) { continue; }
                 const RequestPlanSummary& candidate_plan =
-                    candidate->lane_plans[candidate_lane->lane]->summary();
+                    candidate_lane->ram_entry_id != 0 ? candidate->ram_plan->summary()
+                                                      : candidate->lane_plans[candidate_lane->lane]->summary();
 
                 BackfillClass backfill = BackfillClass::None;
                 if (persistent_backfill_is_safe(*protection_, active.span(),

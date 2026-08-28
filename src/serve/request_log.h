@@ -77,6 +77,9 @@ struct ThroughputReport {
     std::uint64_t decode_rounds           = 0;
     std::uint64_t decode_row_rounds       = 0;
     ninfer::RuntimeStats scheduler;
+    std::size_t kv_ram_capacity_bytes = 0;
+    std::size_t kv_ram_used_bytes     = 0;
+    std::size_t kv_ram_entry_count    = 0;
 };
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
@@ -93,6 +96,11 @@ std::string format_request_rejected(const RequestRejectionLogContext& context);
 std::string format_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
 std::string format_request_error(const RequestLogContext& context, const std::string& message);
 std::string format_throughput(const ThroughputReport& report);
+
+// Human RAM occupancy is MiB by default. Exact bytes stay on JSONL and the Engine API; pass
+// exact_bytes=true, or set NINFER_KV_RAM_LOG_BYTES=1 at the occupancy helper, for debug lines.
+std::string format_kv_ram_size(std::uint64_t bytes, bool exact_bytes);
+std::string format_kv_ram_occupancy(const ninfer::MemorySummary& memory);
 
 // Pure JSON formatters are public to repository tests. Each return value is one complete JSON
 // object without a trailing newline.

@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <unordered_map>
+#include <vector>
 
 namespace ninfer {
 
@@ -104,6 +106,44 @@ public:
 private:
     void* data_       = nullptr;
     std::size_t size_ = 0;
+};
+
+// One cudaHostAlloc region with a first-fit block allocator. try_alloc never throws for
+// capacity; construction throws if the pinned allocation fails.
+class HostPinnedArena {
+public:
+    explicit HostPinnedArena(std::size_t capacity_bytes);
+    ~HostPinnedArena();
+
+    HostPinnedArena(const HostPinnedArena&)            = delete;
+    HostPinnedArena& operator=(const HostPinnedArena&) = delete;
+    HostPinnedArena(HostPinnedArena&& other) noexcept;
+    HostPinnedArena& operator=(HostPinnedArena&& other) noexcept;
+
+    [[nodiscard]] void* try_alloc(std::size_t bytes, std::size_t align = 256);
+    void free(void* block);
+
+    [[nodiscard]] void* base() const noexcept;
+    [[nodiscard]] std::size_t capacity() const noexcept;
+    [[nodiscard]] std::size_t used() const noexcept;
+
+private:
+    struct FreeSpan {
+        std::size_t offset = 0;
+        std::size_t size   = 0;
+    };
+    struct LiveBlock {
+        std::size_t offset = 0;
+        std::size_t size   = 0;
+    };
+
+    void insert_free(std::size_t offset, std::size_t size);
+
+    void* base_       = nullptr;
+    std::size_t cap_  = 0;
+    std::size_t used_ = 0;
+    std::vector<FreeSpan> free_;
+    std::unordered_map<void*, LiveBlock> live_;
 };
 
 using WorkspaceArena = DeviceArena;

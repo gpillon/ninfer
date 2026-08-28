@@ -61,8 +61,17 @@ struct LinearAttentionStatePool {
     [[nodiscard]] Tensor conv_slot(std::uint32_t layer, std::int32_t slot) const;
     [[nodiscard]] Tensor recurrent_slot(std::uint32_t layer, std::int32_t slot) const;
 
+    [[nodiscard]] std::size_t conv_slot_bytes() const noexcept;
+    [[nodiscard]] std::size_t recurrent_slot_bytes() const noexcept;
+    [[nodiscard]] std::size_t conv_host_image_bytes() const noexcept;
+    [[nodiscard]] std::size_t recurrent_host_image_bytes() const noexcept;
+
     void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
+    void pack_slot_to_host(std::int32_t slot, void* conv_dst, void* recurrent_dst,
+                           cudaStream_t stream) const;
+    void unpack_slot_from_host(std::int32_t slot, const void* conv_src, const void* recurrent_src,
+                               cudaStream_t stream);
 };
 
 } // namespace ninfer
