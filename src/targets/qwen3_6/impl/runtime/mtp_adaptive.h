@@ -122,6 +122,32 @@ public:
         last_transition_to_   = selected_window_;
     }
 
+    // Records the true wall-clock cost of a decode round (device dispatch through host sync) at
+    // the width/batch-size/context-band it actually ran at. round_cost() prefers this measured
+    // table over the static prior once a whole (batch, band) bucket has enough evidence across
+    // every width -- graduating per-bucket, not per-width, keeps every width compared within a
+    // single score() call in the same unit (real seconds vs. the prior's arbitrary scale can
+    // never be mixed mid-comparison).
+    void observe_round_duration(std::uint32_t window, std::uint32_t batch_size,
+                                std::uint32_t frontier, double seconds) noexcept {
+        if (window == 0 || window > kAdaptiveMtpMaximumDrafts || batch_size == 0 ||
+            seconds <= 0.0) {
+            return;
+        }
+        const std::size_t batch = std::min<std::size_t>(batch_size, kAdaptiveMtpMaximumBatch) - 1U;
+        const std::size_t band  = frontier_band(frontier);
+        const std::size_t width = window - 1U;
+        const float sample      = static_cast<float>(seconds);
+        float& cost              = measured_seconds_[batch][band][width];
+        std::uint16_t& samples   = measured_samples_[batch][band][width];
+        if (samples == 0) {
+            cost = sample;
+        } else {
+            cost += kCostEwmaAlpha * (sample - cost);
+        }
+        if (samples < kMinSamplesPerWidth * 4U) { ++samples; }
+    }
+
     void observe_execution(std::uint32_t batch_size, std::uint32_t window) noexcept {
         if (batch_size == 0 || batch_size > kAdaptiveMtpMaximumBatch || window == 0 ||
             window > maximum_window_) {
@@ -343,30 +369,75 @@ private:
         return 0;
     }
 
-    [[nodiscard]] float round_cost(std::uint32_t window, std::size_t batch_size,
-                                   std::uint32_t frontier) const noexcept {
-        const std::size_t batch =
-            std::clamp<std::size_t>(batch_size, 1, kAdaptiveMtpMaximumBatch) - 1U;
-        const std::size_t width = std::clamp(window, 1U, kAdaptiveMtpMaximumDrafts) - 1U;
+    // Context-length bands mirror the CUDA-graph tier boundaries used elsewhere in this target
+    // (src/targets/qwen3_6/impl/runtime/layouts_impl.h tier_bytes) so round cost is bucketed at
+    // the same context scales that already drive other capacity decisions in this engine.
+    [[nodiscard]] static std::size_t frontier_band(std::uint32_t frontier) noexcept {
+        if (frontier <= 4096U) { return 0; }
+        if (frontier <= 262144U) { return 1; }
+        if (frontier <= 524288U) { return 2; }
+        return 3;
+    }
+
+    [[nodiscard]] float static_curve_cost(std::uint32_t width_index, std::size_t batch,
+                                          std::uint32_t frontier) const noexcept {
         const std::span<const qwen3_6::MtpAdaptiveCostPoint> curve =
             cost_profile_.batch_curves[batch];
         if (curve.empty()) { return 1.0F; }
         if (curve.size() == 1 || frontier <= curve.front().frontier) {
-            return std::max(curve.front().round_costs[width], 0.001F);
+            return std::max(curve.front().round_costs[width_index], 0.001F);
         }
         if (frontier >= curve.back().frontier) {
-            return std::max(curve.back().round_costs[width], 0.001F);
+            return std::max(curve.back().round_costs[width_index], 0.001F);
         }
-
         std::size_t upper = 1;
         while (upper < curve.size() && frontier > curve[upper].frontier) { ++upper; }
         const qwen3_6::MtpAdaptiveCostPoint& lo = curve[upper - 1U];
         const qwen3_6::MtpAdaptiveCostPoint& hi = curve[upper];
         const float extent = static_cast<float>(hi.frontier - lo.frontier);
         const float offset = static_cast<float>(frontier - lo.frontier);
-        const float cost = lo.round_costs[width] +
-                           offset / extent * (hi.round_costs[width] - lo.round_costs[width]);
+        const float cost = lo.round_costs[width_index] +
+                           offset / extent * (hi.round_costs[width_index] - lo.round_costs[width_index]);
         return std::max(cost, 0.001F);
+    }
+
+    // Real per-round wall-clock cost is only ever observed for widths the controller actually
+    // dispatches -- for a small draft-window config the search deliberately never lands on every
+    // integer width (e.g. width 2 is structurally bypassed when jumping 1->3), so requiring
+    // evidence for every width before trusting any measurement would mean the bucket can never
+    // graduate. Instead: find whichever width in this (batch, band) bucket has the most evidence,
+    // use it to compute a scalar calibration factor against the static prior at that same width,
+    // and apply that factor across the whole prior curve. This keeps every width in a single
+    // round_cost() comparison in one consistent unit (calibrated seconds) while needing real
+    // measurement for only one width to correct the whole bucket's absolute scale.
+    [[nodiscard]] float calibration_factor(std::size_t batch, std::size_t band,
+                                           std::uint32_t frontier) const noexcept {
+        std::size_t anchor        = 0;
+        std::uint16_t best_samples = 0;
+        for (std::size_t width = 0; width < maximum_window_; ++width) {
+            const std::uint16_t samples = measured_samples_[batch][band][width];
+            if (samples > best_samples) {
+                best_samples = samples;
+                anchor       = width;
+            }
+        }
+        if (best_samples < kMinSamplesPerWidth) { return 0.0F; }
+        const float measured = measured_seconds_[batch][band][anchor];
+        const float prior    = static_curve_cost(static_cast<std::uint32_t>(anchor), batch, frontier);
+        const float factor   = measured / prior;
+        return std::clamp(factor, 0.1F, 10.0F);
+    }
+
+    [[nodiscard]] float round_cost(std::uint32_t window, std::size_t batch_size,
+                                   std::uint32_t frontier) const noexcept {
+        const std::size_t batch =
+            std::clamp<std::size_t>(batch_size, 1, kAdaptiveMtpMaximumBatch) - 1U;
+        const std::size_t width = std::clamp(window, 1U, kAdaptiveMtpMaximumDrafts) - 1U;
+        const std::size_t band  = frontier_band(frontier);
+        const float factor      = calibration_factor(batch, band, frontier);
+        const float prior       = static_curve_cost(static_cast<std::uint32_t>(width), batch, frontier);
+        if (factor <= 0.0F) { return prior; }
+        return std::max(prior * factor, 0.000001F);
     }
 
     [[nodiscard]] static std::uint32_t
@@ -378,7 +449,17 @@ private:
         return frontier;
     }
 
+    static constexpr float kCostEwmaAlpha           = 0.25F;
+    static constexpr std::uint16_t kMinSamplesPerWidth = 3;
+    static constexpr std::size_t kFrontierBands     = 4;
+
     qwen3_6::MtpAdaptiveCostProfile cost_profile_;
+    std::array<std::array<std::array<float, kAdaptiveMtpMaximumDrafts>, kFrontierBands>,
+              kAdaptiveMtpMaximumBatch>
+        measured_seconds_{};
+    std::array<std::array<std::array<std::uint16_t, kAdaptiveMtpMaximumDrafts>, kFrontierBands>,
+              kAdaptiveMtpMaximumBatch>
+        measured_samples_{};
     std::uint32_t maximum_window_ = 1;
     std::uint32_t selected_window_ = 1;
     std::uint32_t candidate_window_ = 1;

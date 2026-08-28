@@ -2286,6 +2286,11 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         device.synchronize();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        if (mtp_policy == MtpDraftPolicy::Adaptive) {
+            mtp_controller.observe_round_duration(verification_window,
+                                                  static_cast<std::uint32_t>(lanes.size()),
+                                                  maximum_frontier, seconds);
+        }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
             RequestControl& request       = requests[lanes[row]];
