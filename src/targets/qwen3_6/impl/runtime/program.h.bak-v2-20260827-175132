@@ -9,11 +9,9 @@
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
-#include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
-#include "targets/qwen3_6/impl/runtime/mtp_adaptive.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -88,8 +86,6 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
-    PrefixReuseSource reuse_source            = PrefixReuseSource::None;
-    std::uint64_t ram_entry_id                = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -135,7 +131,6 @@ struct SequenceKVBundle {
 
 struct DecodeGraphProfile {
     std::uint32_t batch_size             = 1;
-    std::uint32_t verification_window    = 0;
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
     std::uint32_t topology_class         = 0;
@@ -174,7 +169,6 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool retained                 = false;
-    std::uint64_t use_tick        = 0;
     RewriteCheckpoint rewrite_checkpoint;
 };
 
@@ -186,8 +180,6 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
-    qwen3_6::detail::MtpAdaptiveSignal mtp_signal;
-    std::uint64_t adaptive_epoch = 0;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -200,10 +192,8 @@ struct RequestControl {
         std::uint32_t prompt_tokens      = 0;
         std::uint32_t initial_mtp_extent = 0;
         double elapsed_seconds           = 0.0;
-        bool host_input_consumed_pending = false;
         bool prepare_mtp                 = false;
         ReusePath reuse                  = ReusePath::FullReset;
-        PrefixReuseSource reuse_source   = PrefixReuseSource::None;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
     };
 
@@ -222,8 +212,6 @@ public:
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
                                                     const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base);
-    [[nodiscard]] RequestPlan plan_ram_reuse(const PreparedPromptData& prompt,
-                                             const RequestBasePlan& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
@@ -244,39 +232,7 @@ public:
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
-    [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
-    // False while a KV dtype keeps an exact-key side store the record cannot carry, so no
-    // host-RAM record is ever captured or matched in that configuration.
-    [[nodiscard]] bool ram_tier_usable() const noexcept;
-    [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
-    // Speculative snapshot of a lane that has just finished prefill and is still actively
-    // serving its own request (not retained/reclaimable) -- see kv_ram_cache.h's
-    // RamCaptureSource::multi_claim. Returns false when the RAM tier is disabled or the lane has
-    // nothing resumable to snapshot.
-    [[nodiscard]] bool capture_active_lane_for_siblings(std::uint32_t lane);
-    // Snapshot a prefill that has just crossed its prompt's shared system/tools boundary into the
-    // host cache, so the other agents of the same burst resume that region instead of each
-    // recomputing it. Reads the live GDN slot and the KV written so far; the only lane state it
-    // writes is tail_hidden, which this same prefill overwrites at its own finalization.
-    void capture_shared_prefix_boundary(SequenceState& sequence, const PreparedPromptData& prompt,
-                                        std::uint32_t frontier);
-    // The frontier at which a sibling request could resume this actively-serving lane's state
-    // (its rewrite-checkpoint frontier, in practice the prompt/response boundary), or 0 when the
-    // lane has no such stable resumable point right now. Nonzero also implies
-    // capture_active_lane_for_siblings(lane) has all its preconditions satisfied.
-    [[nodiscard]] std::uint32_t active_lane_sibling_base(std::uint32_t lane) const noexcept;
-    // The lane's current token ledger (prompt plus whatever has been sampled so far), for the
-    // engine layer to compare against other pending requests' prompts without reaching into
-    // target-internal sequence state directly.
-    [[nodiscard]] std::span<const TokenId> active_lane_tokens(std::uint32_t lane) const noexcept;
-    void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
-    void claim_ram_entry(std::uint64_t entry_id);
-    void release_ram_entry(std::uint64_t entry_id);
-    void consume_ram_entry(std::uint64_t entry_id);
-    [[nodiscard]] qwen3_6::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
-    qwen3_6::detail::KvRamCopySeconds harvest_kv_ram_copy_seconds();
-    [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -300,11 +256,9 @@ public:
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
     const ProposalHead proposal_head;
-    const MtpDraftPolicy mtp_policy;
     const bool vision_enabled;
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
-    const std::size_t kv_ram_capacity_bytes;
     const std::size_t graph_allowance_bytes;
     std::size_t graph_observed_bytes = 0;
     const WorkspacePlan workspace_plan;
@@ -313,8 +267,6 @@ public:
     DeviceArena workspace_storage;
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
-    std::array<std::optional<GdnReplayRecords>, qwen3_6::kMtpDecodeMaximumDrafts>
-        mtp_replay_records;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
@@ -330,11 +282,6 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
-    const qwen3_6::MtpAdaptiveCostProfile mtp_adaptive_costs;
-    qwen3_6::detail::MtpAdaptiveBatchController mtp_controller;
-    std::uint32_t pending_mtp_window = 0;
-    std::uint32_t pending_mtp_batch_size = 0;
-    std::uint64_t next_adaptive_epoch = 0;
 
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;
@@ -349,8 +296,6 @@ public:
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
-    std::optional<qwen3_6::detail::KVRamCache> kv_ram_cache_;
-    std::uint64_t next_use_tick_ = 1;
 
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
@@ -395,29 +340,6 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
-
-    struct ResidentStateView {
-        const std::vector<TokenId>* ledger                    = nullptr;
-        const qwen3_6::detail::ResidentPrefixIdentity* identity = nullptr;
-        std::uint32_t execution_frontier                      = 0;
-        RewriteCheckpoint rewrite_checkpoint;
-        std::uint32_t text_kv_valid           = 0;
-        std::uint32_t mtp_kv_valid            = 0;
-        std::uint32_t dflash_context_frontier = 0;
-        bool tail_hidden_valid                = false;
-        bool backend_image_present            = false;
-    };
-
-    void apply_reuse_decision(RequestPlanImpl& plan, const ResidentStateView& view,
-                              const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
-    void finish_request_plan(RequestPlanImpl& plan, const ResidentStateView* view,
-                             const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
-    [[nodiscard]] qwen3_6::detail::RamCaptureSource ram_capture_source(const SequenceState& sequence);
-    // Shared field-by-field builder behind ram_capture_source(), without the "must be retained"
-    // precondition -- used both by the normal (retained-lane) path and by
-    // capture_active_lane_for_siblings(), which captures a still-active lane instead.
-    [[nodiscard]] qwen3_6::detail::RamCaptureSource
-    ram_capture_source_unchecked(const SequenceState& sequence);
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

@@ -86,6 +86,10 @@ struct RewriteCheckpointByteSpec {
 struct RenderedChat {
     std::string text;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    // End of the leading system/tools block, before the first conversation message. Concurrent
+    // agent requests that share a system prompt and tool set are byte-identical up to here and
+    // diverge immediately after, so it is the frontier at which one prefill can be shared.
+    std::optional<std::size_t> shared_prefix_offset;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

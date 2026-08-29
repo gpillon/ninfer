@@ -350,6 +350,11 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         rendered += "<|im_end|>\n";
     }
 
+    // Everything rendered so far is the system/tools block, which is identical across the agents
+    // of one burst; the per-agent conversation starts below.
+    const std::optional<std::size_t> shared_prefix_offset =
+        rendered.empty() ? std::nullopt : std::optional<std::size_t>(rendered.size());
+
     const long last_query_index  = last_real_user_query(messages);
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
@@ -447,7 +452,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
         }
     }
-    return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
+    return RenderedChat{.text                 = std::move(rendered),
+                        .rewrite_checkpoint   = rewrite_checkpoint,
+                        .shared_prefix_offset = shared_prefix_offset};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

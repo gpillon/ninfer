@@ -73,6 +73,10 @@ struct RewriteCheckpointSpec {
 struct PromptIdentity {
     bool reusable = true;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    // Token frontier ending the leading system/tools block. Concurrent agent requests built from
+    // one system prompt and tool set are identical up to here and diverge immediately after, so a
+    // prefill that crosses it can be snapshotted once and resumed by every sibling of the burst.
+    std::optional<std::uint32_t> shared_prefix_frontier;
 };
 
 struct PrepareStats {

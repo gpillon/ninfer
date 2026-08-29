@@ -167,6 +167,12 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         (base->rewrite_checkpoint &&
                  base->rewrite_checkpoint->frontier < base->summary.prompt_tokens
              ? 1ULL
+             : 0ULL) +
+        // A prefill that crosses the shared system/tools boundary lands a chunk on it so the
+        // region can be snapshotted for the burst's other agents, which costs one extra unit.
+        (prompt.identity.shared_prefix_frontier &&
+                 *prompt.identity.shared_prefix_frontier < base->summary.prompt_tokens
+             ? 1ULL
              : 0ULL);
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
@@ -296,6 +302,13 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
         (plan.vision ? plan.vision->uses.size() : 0ULL) +
         (plan.rewrite_checkpoint_capture &&
                  plan.rewrite_checkpoint_capture->frontier < plan.summary.prompt_tokens
+             ? 1ULL
+             : 0ULL) +
+        // Mirrors the cold projection: only a prefill resuming below the boundary still crosses
+        // it, and so still pays for the extra chunk that lands on it.
+        (prompt.identity.shared_prefix_frontier &&
+                 *prompt.identity.shared_prefix_frontier > plan.reuse_base &&
+                 *prompt.identity.shared_prefix_frontier < plan.summary.prompt_tokens
              ? 1ULL
              : 0ULL);
     plan.summary.service_work_quanta =

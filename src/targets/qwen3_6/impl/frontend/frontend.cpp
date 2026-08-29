@@ -985,6 +985,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             processed.stats.media_preprocess_work_seconds;
         result.prepare.tokenize_seconds    = processed.stats.tokenize_seconds;
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
+        result.identity.shared_prefix_frontier = processed.shared_prefix_frontier;
     } else {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options));
@@ -995,6 +996,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         fi::check_preparation_control(control, "tokenization");
         result.token_ids                   = std::move(encoded.input_ids);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
+        result.identity.shared_prefix_frontier = encoded.shared_prefix_frontier;
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
