@@ -4,6 +4,7 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
+#include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/kv_ram_snapshot.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
@@ -45,6 +46,13 @@ struct RamCaptureSource {
     const PagedKVAllocation* backend   = nullptr;
     const PagedKVPool* backend_pool    = nullptr;
 
+    // The caches themselves, for the exact-key side store the pools do not own, plus the slot row
+    // that store is indexed by. A retained lane is unbound, so the row cannot be read back from
+    // the allocation; it is the owning lane, which is what bind_row uses.
+    const qwen3_6::PagedKVCache* text_cache    = nullptr;
+    const qwen3_6::PagedKVCache* backend_cache = nullptr;
+    std::int32_t residual_row                  = -1;
+
     const LinearAttentionStatePool* gdn = nullptr;
     std::int32_t gdn_current_slot       = -1;
     std::int32_t gdn_checkpoint_slot    = -1;
@@ -74,6 +82,13 @@ struct RamRestoreTarget {
     PagedKVPool* text_pool          = nullptr;
     PagedKVAllocation* backend      = nullptr;
     PagedKVPool* backend_pool       = nullptr;
+
+    // See RamCaptureSource: the destination row of the exact-key side store, which must be
+    // overwritten with the record's own contents so the restored sequence cannot read the keys
+    // left behind by whatever used this row before it.
+    qwen3_6::PagedKVCache* text_cache    = nullptr;
+    qwen3_6::PagedKVCache* backend_cache = nullptr;
+    std::int32_t residual_row            = -1;
 
     LinearAttentionStatePool* gdn     = nullptr;
     std::int32_t gdn_current_slot     = -1;
@@ -154,6 +169,15 @@ private:
         RewriteCheckpointHidden,
         DflashLocal,
         DflashRewriteCheckpoint,
+        // The hyperquant exact-key side store for the captured slot row: one image per side plane
+        // across every layer, plus the row's recent-ring validity words. Absent (length 0) for
+        // every KV dtype that keeps no side store.
+        TextResidualK,
+        TextResidualV,
+        TextRingValid,
+        BackendResidualK,
+        BackendResidualV,
+        BackendRingValid,
         Count
     };
 

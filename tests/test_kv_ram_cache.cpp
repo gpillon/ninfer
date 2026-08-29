@@ -6,6 +6,8 @@
 #include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
+#include <ninfer/targets/qwen3_6/decoder_state.h>
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -15,6 +17,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -257,6 +260,105 @@ int capture_text_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
     source.text_pool = &pool;
     source.stream    = stream;
     return cache.capture(source) ? 0 : 1;
+}
+
+// The hyperquant exact-key side store is indexed by slot row, not by sequence, so a record that
+// travels between rows has to carry its own row's image; restoring into a row that still holds a
+// previous tenant's keys is what made a restored request answer with another request's context.
+// This pins the row indexing in both directions: every layer of the captured row must land in the
+// destination row, and no other row may be touched.
+int test_residual_slot_round_trip(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    int failures  = 0;
+
+    q36::DecoderStateSpec spec;
+    spec.full_attention_layers     = 2;
+    spec.mtp_layers                = 0;
+    spec.capacity                  = 128;
+    spec.kv_heads                  = 4;
+    spec.attention_head_dim        = 256;
+    spec.kv_dtype                  = ninfer::DType::U8;
+    spec.kv_quant_group            = q36::kKvHqQuantGroup;
+    spec.enable_mtp                = false;
+    spec.kv_table_rows             = 3;
+    spec.text_physical_page_groups = 4;
+    // plan_decoder_state rejects a zero-layer linear-attention pool, so this has to describe a
+    // real (if tiny) one even though the residual side store under test is independent of it.
+    spec.linear_attention          = {.layers         = 2,
+                                      .conv_channels  = 8,
+                                      .conv_width     = 4,
+                                      .value_heads    = 2,
+                                      .value_head_dim = 4,
+                                      .key_head_dim   = 3,
+                                      .slot_count     = 4};
+
+    ninfer::LayoutBuilder builder;
+    const q36::DecoderStateLayout layout = q36::plan_decoder_state(builder, spec);
+    ninfer::DeviceArena arena(builder.finish(256));
+    q36::PagedKVCache cache({arena.base(), arena.capacity()}, layout.text_kv);
+    if (!cache.residual_enabled()) {
+        std::cerr << "residual side store is not enabled for the hq layout\n";
+        return 1;
+    }
+
+    const std::size_t slot_bytes = cache.residual_slot_host_bytes();
+    const std::size_t ring_bytes = cache.ring_valid_slot_host_bytes();
+    if (slot_bytes == 0 || ring_bytes == 0) {
+        std::cerr << "residual slot image sizes are empty\n";
+        return 1;
+    }
+
+    // Give every row a distinct fill so a mis-indexed copy cannot be mistaken for a correct one.
+    const auto fill_row = [&](std::int32_t row, unsigned char byte) {
+        std::vector<unsigned char> k(slot_bytes, byte);
+        std::vector<unsigned char> v(slot_bytes, static_cast<unsigned char>(byte + 1));
+        std::vector<unsigned char> ring(ring_bytes, static_cast<unsigned char>(byte + 2));
+        cache.unpack_residual_slot_from_host(row, k.data(), v.data(), ring.data(), ctx.stream);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    };
+    fill_row(0, 0x10);
+    fill_row(1, 0x40);
+    fill_row(2, 0x70);
+
+    std::vector<unsigned char> k_image(slot_bytes);
+    std::vector<unsigned char> v_image(slot_bytes);
+    std::vector<unsigned char> ring_image(ring_bytes);
+    cache.pack_residual_slot_to_host(1, k_image.data(), v_image.data(), ring_image.data(),
+                                     ctx.stream);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    if (k_image != std::vector<unsigned char>(slot_bytes, 0x40) ||
+        v_image != std::vector<unsigned char>(slot_bytes, 0x41) ||
+        ring_image != std::vector<unsigned char>(ring_bytes, 0x42)) {
+        ++failures;
+        std::cerr << "residual slot pack read the wrong row\n";
+    }
+
+    // Restore row 1's image into row 2, the case a host-RAM restore performs.
+    cache.unpack_residual_slot_from_host(2, k_image.data(), v_image.data(), ring_image.data(),
+                                         ctx.stream);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+
+    const auto read_row = [&](std::int32_t row) {
+        std::vector<unsigned char> k(slot_bytes);
+        std::vector<unsigned char> v(slot_bytes);
+        std::vector<unsigned char> ring(ring_bytes);
+        cache.pack_residual_slot_to_host(row, k.data(), v.data(), ring.data(), ctx.stream);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        return std::tuple{k, v, ring};
+    };
+    const auto [k2, v2, ring2] = read_row(2);
+    if (k2 != k_image || v2 != v_image || ring2 != ring_image) {
+        ++failures;
+        std::cerr << "residual slot unpack did not reach the destination row\n";
+    }
+    const auto [k0, v0, ring0] = read_row(0);
+    if (k0 != std::vector<unsigned char>(slot_bytes, 0x10) ||
+        v0 != std::vector<unsigned char>(slot_bytes, 0x11) ||
+        ring0 != std::vector<unsigned char>(ring_bytes, 0x12)) {
+        ++failures;
+        std::cerr << "residual slot unpack disturbed an unrelated row\n";
+    }
+    return failures;
 }
 
 int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
@@ -1627,6 +1729,15 @@ int main() {
     failures += test_destructor_with_inflight_copies(ctx, paged_pool);
     failures += test_spill_drop_keeps_indexed_source(ctx, paged_pool);
     failures += test_full_state_image(ctx);
+    // Guarded: a test that throws during its own setup would otherwise abort the process with no
+    // diagnostic at all, which reads exactly like a clean pass to anything checking only for
+    // absence of failure output.
+    try {
+        failures += test_residual_slot_round_trip(ctx);
+    } catch (const std::exception& error) {
+        ++failures;
+        std::cerr << "residual slot round-trip threw: " << error.what() << '\n';
+    }
 
     return failures == 0 ? 0 : fail("kv ram cache core test failed");
 }

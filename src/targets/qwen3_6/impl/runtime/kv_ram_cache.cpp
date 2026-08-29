@@ -13,8 +13,8 @@ namespace ninfer::targets::qwen3_6::detail {
 namespace {
 
 constexpr std::uint32_t kRamMagic   = 0x4D41524E;
-constexpr std::uint32_t kRamVersion = 1;
-constexpr std::size_t kSectionCount = 12;
+constexpr std::uint32_t kRamVersion = 2;
+constexpr std::size_t kSectionCount = 18;
 constexpr std::size_t kHostAlign    = 8;
 constexpr std::size_t kDeviceAlign  = 256;
 constexpr std::size_t kFingerprint  = 56;
@@ -160,13 +160,18 @@ struct HeaderView {
     std::uint64_t gdn_conv_bytes          = 0;
     std::uint64_t gdn_recurrent_bytes     = 0;
     std::uint64_t cyclic_lane_bytes       = 0;
+    std::uint64_t text_residual_slot_bytes    = 0;
+    std::uint64_t backend_residual_slot_bytes = 0;
+    std::uint64_t ring_valid_slot_bytes       = 0;
     std::array<std::uint64_t, kSectionCount> offset{};
     std::array<std::uint64_t, kSectionCount> length{};
     std::uint64_t entry_bytes             = 0;
     std::size_t header_bytes              = 0;
 };
 
-constexpr std::size_t kFixedHeader = 348;
+// Fixed prologue: the scalar fields written by write_fixed_header, then kSectionCount
+// offset/length pairs and entry_bytes. Six more sections and three more scalars over version 1.
+constexpr std::size_t kFixedHeader = 348 + 6 * 16 + 3 * 8;
 
 std::size_t header_bytes_for(std::uint32_t text_planes, std::uint32_t backend_planes) {
     return align_up(kFixedHeader + kFingerprint * (text_planes + backend_planes), kHostAlign);
@@ -208,6 +213,9 @@ void write_fixed_header(Cursor& w, const HeaderView& h) {
     w.u64(h.gdn_conv_bytes);
     w.u64(h.gdn_recurrent_bytes);
     w.u64(h.cyclic_lane_bytes);
+    w.u64(h.text_residual_slot_bytes);
+    w.u64(h.backend_residual_slot_bytes);
+    w.u64(h.ring_valid_slot_bytes);
     for (std::size_t i = 0; i < kSectionCount; ++i) {
         w.u64(h.offset[i]);
         w.u64(h.length[i]);
@@ -257,6 +265,9 @@ HeaderView read_header(const void* block, std::size_t bytes) {
     h.gdn_conv_bytes          = r.u64();
     h.gdn_recurrent_bytes     = r.u64();
     h.cyclic_lane_bytes       = r.u64();
+    h.text_residual_slot_bytes    = r.u64();
+    h.backend_residual_slot_bytes = r.u64();
+    h.ring_valid_slot_bytes       = r.u64();
     for (std::size_t i = 0; i < kSectionCount; ++i) {
         h.offset[i] = r.u64();
         h.length[i] = r.u64();
@@ -668,6 +679,24 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         header.gdn_conv_bytes      = source.gdn->conv_host_image_bytes();
         header.gdn_recurrent_bytes = source.gdn->recurrent_host_image_bytes();
     }
+    // The exact-key side store lives outside the paged pool and is indexed by slot row, so a
+    // record that omits it would leave a restored sequence reading the row's previous tenant.
+    const bool text_residual =
+        source.text_cache != nullptr && source.text_cache->residual_enabled();
+    const bool backend_residual =
+        source.backend != nullptr && source.backend_cache != nullptr &&
+        source.backend_cache->residual_enabled();
+    if ((text_residual || backend_residual) && source.residual_row < 0) {
+        throw std::logic_error("RAM capture needs the residual slot row");
+    }
+    if (text_residual) {
+        header.text_residual_slot_bytes = source.text_cache->residual_slot_host_bytes();
+        header.ring_valid_slot_bytes    = source.text_cache->ring_valid_slot_host_bytes();
+    }
+    if (backend_residual) {
+        header.backend_residual_slot_bytes = source.backend_cache->residual_slot_host_bytes();
+        header.ring_valid_slot_bytes       = source.backend_cache->ring_valid_slot_host_bytes();
+    }
 
     std::array<std::size_t, kSectionCount> lengths{};
     std::array<std::size_t, kSectionCount> aligns{};
@@ -689,6 +718,12 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
     lengths[11] = source.dflash_checkpoint && source.rewrite_valid
                       ? source.dflash_checkpoint->lane_host_bytes()
                       : 0;
+    lengths[12] = text_residual ? header.text_residual_slot_bytes : 0;
+    lengths[13] = lengths[12];
+    lengths[14] = text_residual ? header.ring_valid_slot_bytes : 0;
+    lengths[15] = backend_residual ? header.backend_residual_slot_bytes : 0;
+    lengths[16] = lengths[15];
+    lengths[17] = backend_residual ? header.ring_valid_slot_bytes : 0;
     aligns[0] = kHostAlign;
     aligns[1] = kHostAlign;
     for (std::size_t i = 2; i < kSectionCount; ++i) { aligns[i] = kDeviceAlign; }
@@ -803,6 +838,20 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
                                                         source.stream);
             copies_launched = true;
         }
+        if (lengths[12] != 0) {
+            start_device_copies();
+            source.text_cache->pack_residual_slot_to_host(
+                source.residual_row, raw + header.offset[12], raw + header.offset[13],
+                raw + header.offset[14], source.stream);
+            copies_launched = true;
+        }
+        if (lengths[15] != 0) {
+            start_device_copies();
+            source.backend_cache->pack_residual_slot_to_host(
+                source.residual_row, raw + header.offset[15], raw + header.offset[16],
+                raw + header.offset[17], source.stream);
+            copies_launched = true;
+        }
 
         if (next_id_ == 0) { throw std::logic_error("RAM cache entry id overflow"); }
         Record record;
@@ -890,6 +939,35 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
         header.tail_hidden_bytes != target.tail_hidden->bytes()) {
         throw std::logic_error("RAM entry hidden geometry mismatch");
     }
+    // A cache that keeps an exact-key side store must be handed the record's own copy of it. If
+    // the record carries none, the destination row would keep whatever the previous tenant of
+    // that row left behind and the decode kernel would attend to it, so refuse rather than
+    // restore a sequence the record only partly describes.
+    const bool text_residual =
+        target.text_cache != nullptr && target.text_cache->residual_enabled();
+    const bool backend_residual = target.backend != nullptr && target.backend_cache != nullptr &&
+                                  target.backend_cache->residual_enabled();
+    if ((text_residual && header.length[12] == 0) ||
+        (backend_residual && header.length[15] == 0)) {
+        throw std::logic_error("RAM entry lacks the exact-key side store this cache requires");
+    }
+    if ((header.length[12] != 0 && !text_residual) ||
+        (header.length[15] != 0 && !backend_residual)) {
+        throw std::logic_error("RAM entry carries a side store this cache does not use");
+    }
+    if ((text_residual || backend_residual) && target.residual_row < 0) {
+        throw std::logic_error("RAM restore needs the residual slot row");
+    }
+    if (text_residual &&
+        (header.text_residual_slot_bytes != target.text_cache->residual_slot_host_bytes() ||
+         header.ring_valid_slot_bytes != target.text_cache->ring_valid_slot_host_bytes())) {
+        throw std::logic_error("RAM entry residual geometry mismatch");
+    }
+    if (backend_residual &&
+        (header.backend_residual_slot_bytes != target.backend_cache->residual_slot_host_bytes() ||
+         header.ring_valid_slot_bytes != target.backend_cache->ring_valid_slot_host_bytes())) {
+        throw std::logic_error("RAM entry backend residual geometry mismatch");
+    }
 
     begin_copies(record, target.stream);
     unpack_paged_kv_allocation_from_host(*target.text, *target.text_pool, raw + header.offset[2],
@@ -928,6 +1006,16 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
     if (target.dflash_checkpoint != nullptr && header.length[11] != 0) {
         target.dflash_checkpoint->copy_lane_from_host(raw + header.offset[11], target.dflash_lane,
                                                       target.stream);
+    }
+    if (header.length[12] != 0) {
+        target.text_cache->unpack_residual_slot_from_host(
+            target.residual_row, raw + header.offset[12], raw + header.offset[13],
+            raw + header.offset[14], target.stream);
+    }
+    if (header.length[15] != 0) {
+        target.backend_cache->unpack_residual_slot_from_host(
+            target.residual_row, raw + header.offset[15], raw + header.offset[16],
+            raw + header.offset[17], target.stream);
     }
     record_copies(record, target.stream);
     pending_load_id_ = entry_id;

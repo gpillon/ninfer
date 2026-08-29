@@ -1003,12 +1003,18 @@ ProgramImplCore::ram_capture_source_unchecked(const SequenceState& sequence) {
             sequence.ledger, sequence.prefix_identity, sequence.rewrite_checkpoint.frontier);
         source.hash_c_valid = true;
     }
-    source.text      = &sequence.kv->text;
-    source.text_pool = &decoder->text_kv.pool();
+    source.text       = &sequence.kv->text;
+    source.text_pool  = &decoder->text_kv.pool();
+    source.text_cache = &decoder->text_kv;
     if (sequence.kv->backend) {
-        source.backend      = &*sequence.kv->backend;
-        source.backend_pool = &backend_kv_cache()->pool();
+        source.backend       = &*sequence.kv->backend;
+        source.backend_pool  = &backend_kv_cache()->pool();
+        source.backend_cache = backend_kv_cache();
     }
+    // The exact-key side store is indexed by slot row. A retained lane is unbound, so the row is
+    // not readable from the allocation; bind_sequence_kv always binds a lane to its own index, so
+    // the lane is that row.
+    source.residual_row = static_cast<std::int32_t>(sequence.lane);
     source.gdn                 = &decoder->linear_attention;
     source.gdn_current_slot    = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
     source.gdn_checkpoint_slot =
@@ -1028,24 +1034,20 @@ ProgramImplCore::ram_capture_source_unchecked(const SequenceState& sequence) {
     return source;
 }
 
-// A host-RAM record describes a sequence completely only when the paged KV store holds the whole
-// of it. The hyperquant KV dtypes keep, alongside the quantised pages, an exact-key side store
-// (kGqaHqSinkKeys sink rows plus a kGqaHqRecentKeys recent ring, PagedKVCache::residual_k_/
-// residual_v_/ring_valid_) that is indexed by block-table row, not by sequence -- and a record
-// carries no section for it. Restoring a record therefore binds a freshly acquired row whose side
-// store still holds whatever sequence used that row last, and the decode kernel reads it: the
-// sink rows unconditionally (gqa_attention_decode_bf16.cuh has no validity gate for key <
-// kGqaHqSinkKeys) and the recent window wherever revalidate_residual_ring left a slot marked
-// valid -- which it does off the record's own frontier, as though the row held this sequence's
-// history. The restored request then attends to another request's exact keys. Measured: a prompt
-// answering "ZAFFIRO" when prefilled cold answers "Nessuna" when served through an
-// append-at-frontier host-RAM restore, and a checkpoint restore returned a filler request's reply
-// verbatim. So the RAM tier stays off entirely while the side store is in use; bf16/int8 KV has
-// no side store and keeps full host-RAM reuse. Capturing residual_k/residual_v/ring_valid into
-// the record (~25 MiB on top of ~500 MiB) is the real cure and is left as follow-up work.
-bool ProgramImplCore::ram_tier_usable() const noexcept {
-    return kv_ram_cache_.has_value() && !decoder->text_kv.residual_enabled();
-}
+// A host-RAM record is usable only if it describes the sequence completely. Beyond the paged KV
+// store, the hyperquant KV dtypes keep an exact-key side store -- kGqaHqSinkKeys sink rows plus a
+// kGqaHqRecentKeys recent ring, PagedKVCache::residual_k_/residual_v_/ring_valid_ -- indexed by
+// slot row rather than by sequence. Records used not to carry it, so a restore left the
+// destination row holding whatever sequence used it last and the decode kernel read exactly that:
+// the sink rows unconditionally (gqa_attention_decode_bf16.cuh has no validity gate for key <
+// kGqaHqSinkKeys) and the recent window wherever revalidate_residual_ring had marked a slot valid.
+// The record now carries the row's own image (Section::TextResidualK onwards) and the restore
+// overwrites the destination row with it, after which the existing revalidate_residual_ring call
+// in start_prefill_lane narrows the ring exactly as it does for a lane that never left the device.
+// unpack_device refuses any record whose side-store sections do not match what the target cache
+// keeps, so this predicate only has to answer whether the tier itself is enabled -- but it stays a
+// named hook for a future dtype that adds state a record cannot carry.
+bool ProgramImplCore::ram_tier_usable() const noexcept { return kv_ram_cache_.has_value(); }
 
 bool ProgramImplCore::capture_retained_lane(std::uint32_t lane) {
     if (!ram_tier_usable() || !has_retained_lane(lane)) { return true; }
@@ -1131,10 +1133,15 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
         target.backend_dst_pages = backend_pages;
         target.text              = &sequence.kv->text;
         target.text_pool         = &decoder->text_kv.pool();
+        target.text_cache        = &decoder->text_kv;
         if (sequence.kv->backend) {
-            target.backend      = &*sequence.kv->backend;
-            target.backend_pool = &backend_kv_cache()->pool();
+            target.backend       = &*sequence.kv->backend;
+            target.backend_pool  = &backend_kv_cache()->pool();
+            target.backend_cache = backend_kv_cache();
         }
+        // Overwrite this lane's side-store row with the record's own, so the restored sequence
+        // cannot read the exact keys left behind by the row's previous tenant.
+        target.residual_row = static_cast<std::int32_t>(sequence.lane);
         target.gdn                 = &decoder->linear_attention;
         target.gdn_current_slot    = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
         target.gdn_checkpoint_slot =

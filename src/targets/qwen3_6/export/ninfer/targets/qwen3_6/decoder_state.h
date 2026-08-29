@@ -108,6 +108,22 @@ public:
     void invalidate_residual_ring(std::int32_t row, std::uint32_t first_key,
                                   std::uint32_t end_key, cudaStream_t stream = nullptr);
 
+    // Host image sizes for one slot row of the residual side store: residual_slot_host_bytes()
+    // covers every layer of one side plane (K and V are equal), ring_valid_slot_host_bytes()
+    // the row's validity words. Both are zero when the feature is off.
+    [[nodiscard]] std::size_t residual_slot_host_bytes() const noexcept;
+    [[nodiscard]] std::size_t ring_valid_slot_host_bytes() const noexcept;
+
+    // Round-trips one slot row of the side store. The side store is indexed by slot row rather
+    // than by sequence, so a sequence that leaves the device and comes back must carry its row's
+    // contents with it: a restore into a row still holding the previous tenant's exact keys makes
+    // the decode kernel attend to that tenant (the sink rows are read with no validity gate).
+    // Both directions are no-ops while the feature is off.
+    void pack_residual_slot_to_host(std::int32_t row, void* k_dst, void* v_dst, void* ring_dst,
+                                    cudaStream_t stream = nullptr) const;
+    void unpack_residual_slot_from_host(std::int32_t row, const void* k_src, const void* v_src,
+                                        const void* ring_src, cudaStream_t stream = nullptr);
+
     [[nodiscard]] PagedKVCacheView execution_view(const PagedKVAllocation& allocation) const;
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;

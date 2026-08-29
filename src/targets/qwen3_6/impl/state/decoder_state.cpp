@@ -1,5 +1,6 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 
+#include "core/device.h"
 #include "core/kv_ring_bits.h"
 
 #include <ninfer/ops/gqa_attention.h>
@@ -240,6 +241,82 @@ void PagedKVCache::invalidate_residual_ring(std::int32_t row, std::uint32_t firs
     apply_kv_ring_valid_words(static_cast<std::uint32_t*>(ring_valid_.data) +
                                   static_cast<std::size_t>(row) * kRingWords,
                               keep, kZeroWords, kRingWords, stream);
+}
+
+std::size_t PagedKVCache::residual_slot_host_bytes() const noexcept {
+    if (residual_k_.data == nullptr) { return 0; }
+    return static_cast<std::size_t>(residual_k_.nb[3]) * layers_;
+}
+
+std::size_t PagedKVCache::ring_valid_slot_host_bytes() const noexcept {
+    if (ring_valid_.data == nullptr) { return 0; }
+    return static_cast<std::size_t>(ring_valid_.nb[1]);
+}
+
+void PagedKVCache::pack_residual_slot_to_host(std::int32_t row, void* k_dst, void* v_dst,
+                                              void* ring_dst, cudaStream_t stream) const {
+    if (residual_k_.data == nullptr) { return; }
+    if (row < 0 || row >= pool_.table_row_count()) {
+        throw std::out_of_range("Paged KV residual row is out of range");
+    }
+    if (k_dst == nullptr || v_dst == nullptr || ring_dst == nullptr) {
+        throw std::invalid_argument("Paged KV residual pack destination is null");
+    }
+    // Layer l's plane for this row is the dim-3 slice at l * table_rows + row, so the row's image
+    // is one contiguous nb[3]-byte block per layer, gathered with the layer stride.
+    const std::size_t rows        = static_cast<std::size_t>(pool_.table_row_count());
+    const std::size_t plane_bytes = static_cast<std::size_t>(residual_k_.nb[3]);
+    const auto* k_src             = static_cast<const unsigned char*>(residual_k_.data);
+    const auto* v_src             = static_cast<const unsigned char*>(residual_v_.data);
+    auto* k_out                   = static_cast<unsigned char*>(k_dst);
+    auto* v_out                   = static_cast<unsigned char*>(v_dst);
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+        const std::size_t slice = (static_cast<std::size_t>(layer) * rows +
+                                   static_cast<std::size_t>(row)) * plane_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(k_out, k_src + slice, plane_bytes, cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_CHECK(cudaMemcpyAsync(v_out, v_src + slice, plane_bytes, cudaMemcpyDeviceToHost,
+                                   stream));
+        k_out += plane_bytes;
+        v_out += plane_bytes;
+    }
+    const std::size_t ring_bytes = ring_valid_slot_host_bytes();
+    CUDA_CHECK(cudaMemcpyAsync(ring_dst,
+                               static_cast<const unsigned char*>(ring_valid_.data) +
+                                   static_cast<std::size_t>(row) * ring_bytes,
+                               ring_bytes, cudaMemcpyDeviceToHost, stream));
+}
+
+void PagedKVCache::unpack_residual_slot_from_host(std::int32_t row, const void* k_src,
+                                                  const void* v_src, const void* ring_src,
+                                                  cudaStream_t stream) {
+    if (residual_k_.data == nullptr) { return; }
+    if (row < 0 || row >= pool_.table_row_count()) {
+        throw std::out_of_range("Paged KV residual row is out of range");
+    }
+    if (k_src == nullptr || v_src == nullptr || ring_src == nullptr) {
+        throw std::invalid_argument("Paged KV residual unpack source is null");
+    }
+    const std::size_t rows        = static_cast<std::size_t>(pool_.table_row_count());
+    const std::size_t plane_bytes = static_cast<std::size_t>(residual_k_.nb[3]);
+    auto* k_dst                   = static_cast<unsigned char*>(residual_k_.data);
+    auto* v_dst                   = static_cast<unsigned char*>(residual_v_.data);
+    const auto* k_in              = static_cast<const unsigned char*>(k_src);
+    const auto* v_in              = static_cast<const unsigned char*>(v_src);
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+        const std::size_t slice = (static_cast<std::size_t>(layer) * rows +
+                                   static_cast<std::size_t>(row)) * plane_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(k_dst + slice, k_in, plane_bytes, cudaMemcpyHostToDevice,
+                                   stream));
+        CUDA_CHECK(cudaMemcpyAsync(v_dst + slice, v_in, plane_bytes, cudaMemcpyHostToDevice,
+                                   stream));
+        k_in += plane_bytes;
+        v_in += plane_bytes;
+    }
+    const std::size_t ring_bytes = ring_valid_slot_host_bytes();
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<unsigned char*>(ring_valid_.data) +
+                                   static_cast<std::size_t>(row) * ring_bytes,
+                               ring_src, ring_bytes, cudaMemcpyHostToDevice, stream));
 }
 
 std::size_t PagedKVCacheLayout::payload_bytes() const noexcept {
