@@ -247,6 +247,19 @@ public:
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
+    // Speculative snapshot of a lane that has just finished prefill and is still actively
+    // serving its own request (not retained/reclaimable) -- see kv_ram_cache.h's
+    // RamCaptureSource::multi_claim. No-op (returns true) if the RAM tier is disabled.
+    [[nodiscard]] bool capture_active_lane_for_siblings(std::uint32_t lane);
+    // The frontier at which a sibling request could resume this actively-serving lane's state
+    // (its rewrite-checkpoint frontier, in practice the prompt/response boundary), or 0 when the
+    // lane has no such stable resumable point right now. Nonzero also implies
+    // capture_active_lane_for_siblings(lane) has all its preconditions satisfied.
+    [[nodiscard]] std::uint32_t active_lane_sibling_base(std::uint32_t lane) const noexcept;
+    // The lane's current token ledger (prompt plus whatever has been sampled so far), for the
+    // engine layer to compare against other pending requests' prompts without reaching into
+    // target-internal sequence state directly.
+    [[nodiscard]] std::span<const TokenId> active_lane_tokens(std::uint32_t lane) const noexcept;
     void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
     void claim_ram_entry(std::uint64_t entry_id);
     void release_ram_entry(std::uint64_t entry_id);
@@ -390,6 +403,11 @@ private:
     void finish_request_plan(RequestPlanImpl& plan, const ResidentStateView* view,
                              const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
     [[nodiscard]] qwen3_6::detail::RamCaptureSource ram_capture_source(const SequenceState& sequence);
+    // Shared field-by-field builder behind ram_capture_source(), without the "must be retained"
+    // precondition -- used both by the normal (retained-lane) path and by
+    // capture_active_lane_for_siblings(), which captures a still-active lane instead.
+    [[nodiscard]] qwen3_6::detail::RamCaptureSource
+    ram_capture_source_unchecked(const SequenceState& sequence);
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

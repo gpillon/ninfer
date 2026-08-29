@@ -246,6 +246,21 @@ bool Program<Variant>::capture_retained_lane(std::uint32_t lane) {
 }
 
 template <>
+bool Program<Variant>::capture_active_lane_for_siblings(std::uint32_t lane) {
+    return impl_->capture_active_lane_for_siblings(lane);
+}
+
+template <>
+std::uint32_t Program<Variant>::active_lane_sibling_base(std::uint32_t lane) const noexcept {
+    return impl_->active_lane_sibling_base(lane);
+}
+
+template <>
+std::span<const TokenId> Program<Variant>::active_lane_tokens(std::uint32_t lane) const noexcept {
+    return impl_->active_lane_tokens(lane);
+}
+
+template <>
 void Program<Variant>::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,
                                          const RequestPlan<Variant>& plan) {
     impl_->restore_ram_entry(lane, entry_id, plan);

@@ -182,6 +182,9 @@ public:
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
+    [[nodiscard]] bool capture_active_lane_for_siblings(std::uint32_t lane);
+    [[nodiscard]] std::uint32_t active_lane_sibling_base(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::span<const TokenId> active_lane_tokens(std::uint32_t lane) const noexcept;
     void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,
                            const RequestPlan<Variant>& plan);
     void claim_ram_entry(std::uint64_t entry_id);

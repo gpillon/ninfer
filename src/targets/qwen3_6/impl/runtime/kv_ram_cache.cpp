@@ -542,6 +542,14 @@ void KVRamCache::consume(std::uint64_t entry_id) {
     if (!record.pinned) { throw std::logic_error("RAM cache consume requires a claimed entry"); }
     ++restores_;
     note_lineage_hit(record.origin_hash);
+    if (record.multi_claim) {
+        // Another sibling may still want to restore from this same entry -- release the claim
+        // (it becomes matchable again via plan_match) instead of erasing it. It ages out through
+        // ordinary FIFO/tiered eviction like any other record once nothing claims it further.
+        record.pinned = false;
+        bump_version();
+        return;
+    }
     retire_record(record);
     records_.erase(entry_id);
     fifo_.erase(std::remove(fifo_.begin(), fifo_.end(), entry_id), fifo_.end());
@@ -805,6 +813,7 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         record.bytes               = header.entry_bytes;
         record.origin_hash         = hash_origin(source.ledger);
         record.protected_tier      = lineage_is_hot(record.origin_hash);
+        record.multi_claim         = source.multi_claim;
         record.copies_start        = copies_start;
         copies_start               = nullptr;
         const auto [it, inserted]  = records_.emplace(record.id, record);

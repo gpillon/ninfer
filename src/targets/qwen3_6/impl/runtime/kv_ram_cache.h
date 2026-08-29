@@ -57,6 +57,14 @@ struct RamCaptureSource {
     std::int32_t dflash_lane               = 0;
 
     cudaStream_t stream = nullptr;
+
+    // True for a speculative snapshot of a lane that is still actively serving its own request
+    // (captured right as its prefill completes, before decode -- see
+    // ProgramImplCore::capture_active_lane_for_siblings), taken on the chance that another
+    // pending request shares enough of its leading prompt to be worth restoring from it. Unlike
+    // an ordinary terminal-lane capture, more than one sibling may legitimately want to restore
+    // from the same entry, so it must not be erased after the first restore.
+    bool multi_claim = false;
 };
 
 struct RamRestoreTarget {
@@ -171,6 +179,11 @@ private:
         // of displacing checkpoints from conversations that keep coming back.
         std::uint64_t origin_hash      = 0;
         bool protected_tier            = false;
+        // See RamCaptureSource::multi_claim. consume() releases the claim instead of erasing
+        // the record for entries captured this way, so a second/third sibling can independently
+        // claim/restore the same entry; it then ages out through ordinary eviction like any
+        // other record, no special-cased cleanup required.
+        bool multi_claim               = false;
     };
 
     struct Layout {

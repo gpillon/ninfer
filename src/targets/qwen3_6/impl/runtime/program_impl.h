@@ -977,6 +977,11 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence) {
     if (!sequence.kv || !sequence.retained) {
         throw std::logic_error("RAM capture requires a retained sequence bundle");
     }
+    return ram_capture_source_unchecked(sequence);
+}
+
+qwen3_6::detail::RamCaptureSource
+ProgramImplCore::ram_capture_source_unchecked(const SequenceState& sequence) {
     qwen3_6::detail::RamCaptureSource source;
     source.execution_frontier      = sequence.execution_frontier;
     source.ledger_frontier         = sequence.ledger_frontier;
@@ -1026,6 +1031,42 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence) {
 bool ProgramImplCore::capture_retained_lane(std::uint32_t lane) {
     if (!kv_ram_cache_ || !has_retained_lane(lane)) { return true; }
     return kv_ram_cache_->capture(ram_capture_source(sequences[lane]));
+}
+
+bool ProgramImplCore::capture_active_lane_for_siblings(std::uint32_t lane) {
+    // Deliberately not gated on sequence.retained: this snapshots a lane that is still actively
+    // serving its own request. sequence.retained must stay false so every other lane-reclaim
+    // path (evict_retained_lane's victim scan, has_retained_lane callers) keeps treating this
+    // lane as busy, not reclaimable -- only the prompt-region KV/GDN/tail-hidden state this reads
+    // is snapshotted; nothing about the live lane is touched or torn down.
+    if (active_lane_sibling_base(lane) == 0) { return false; }
+    qwen3_6::detail::RamCaptureSource source = ram_capture_source_unchecked(sequences[lane]);
+    source.multi_claim                       = true;
+    return kv_ram_cache_->capture(source);
+}
+
+std::uint32_t ProgramImplCore::active_lane_sibling_base(std::uint32_t lane) const noexcept {
+    if (!kv_ram_cache_ || lane >= max_concurrency) { return 0; }
+    const SequenceState& sequence = sequences[lane];
+    // A sibling can only resume this lane's state at a frontier where the recurrent (GDN) state
+    // has a checkpoint snapshot -- arbitrary mid-prompt frontiers are not resumable. The rewrite
+    // checkpoint (captured at prefill completion, frontier at the prompt/response boundary) is
+    // the one such point on an actively-decoding lane. The remaining checks mirror
+    // KVRamCache::capture()'s ledger invariants so a capture attempt can never throw mid-admission.
+    if (!sequence.kv || !sequence.tail_hidden_valid || !sequence.rewrite_checkpoint.valid ||
+        sequence.rewrite_checkpoint.frontier == 0 ||
+        sequence.text_kv_valid != sequence.execution_frontier ||
+        sequence.ledger_frontier != sequence.execution_frontier + 1 ||
+        sequence.ledger.size() != sequence.ledger_frontier ||
+        sequence.prefix_identity.size() != sequence.ledger_frontier) {
+        return 0;
+    }
+    return sequence.rewrite_checkpoint.frontier;
+}
+
+std::span<const TokenId> ProgramImplCore::active_lane_tokens(std::uint32_t lane) const noexcept {
+    if (lane >= max_concurrency) { return {}; }
+    return std::span<const TokenId>(sequences[lane].ledger);
 }
 
 void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,

@@ -756,6 +756,14 @@ private:
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         ensure_ram_candidate(request);
+        if (maybe_capture_sibling_source(request,
+                                         request->ram_plan
+                                             ? request->ram_plan->summary().reusable_prompt_tokens
+                                             : 0U)) {
+            // The capture bumped the KVRamCache index version, so this re-plans against the
+            // just-published sibling snapshot instead of reusing the cached (pre-capture) plan.
+            ensure_ram_candidate(request);
+        }
         const Plan* ram_plan = request->ram_plan ? &*request->ram_plan : nullptr;
         const std::uint32_t ram_reuse =
             ram_plan != nullptr ? ram_plan->summary().reusable_prompt_tokens : 0U;
@@ -1018,6 +1026,50 @@ private:
             // fail_all the engine over one request's host-side error (the req-3 class).
             return AdmissionProgress::ControlProgress;
         }
+    }
+
+    // On-demand snapshot of an actively-decoding lane into the host-RAM cache, triggered from
+    // the SIBLING's admission (find_admission_lane) rather than from the source's prefill
+    // completion. At the source-side trigger point the sibling has typically not yet cleared its
+    // own HTTP-receive/tokenize pipeline into pending_, so a source-side check races and loses;
+    // at admission time the sibling is by definition present and the source lane's state is
+    // directly readable on this same worker thread -- no race, no deferral machinery. The
+    // capture (~30-50ms D2H) is paid only when an active lane offers a resumable checkpoint
+    // (active_lane_sibling_base != 0) whose leading tokens exactly match this request's prompt
+    // beyond a large threshold AND no existing host-RAM candidate already covers as much; the
+    // common non-sharing case pays only the token comparison, which the admission-time
+    // measurement instrumentation already established as cheap. Returns true if a capture was
+    // published (the caller then re-plans against the bumped KVRamCache index).
+    bool maybe_capture_sibling_source(const std::shared_ptr<Request>& request,
+                                      std::uint32_t existing_ram_reuse) {
+        constexpr std::uint32_t kSiblingCaptureThreshold = 2048;
+        if (!request->options.execution.allow_prefix_reuse) { return false; }
+        const targets::qwen3_6::PreparedPromptData& data =
+            targets::qwen3_6::PreparedPromptAccess::view(request->prompt);
+        if (data.token_ids.size() < kSiblingCaptureThreshold) { return false; }
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] == nullptr) { continue; }
+            const std::uint32_t base = instance_.program->active_lane_sibling_base(lane);
+            if (base < kSiblingCaptureThreshold || base <= existing_ram_reuse ||
+                base > data.token_ids.size()) {
+                continue;
+            }
+            const std::span<const TokenId> lane_tokens =
+                instance_.program->active_lane_tokens(lane);
+            if (lane_tokens.size() < base ||
+                !std::equal(lane_tokens.begin(), lane_tokens.begin() + base,
+                            data.token_ids.begin())) {
+                continue;
+            }
+            try {
+                if (instance_.program->capture_active_lane_for_siblings(lane)) { return true; }
+            } catch (...) {
+                // A failed opportunistic snapshot must never fail the incoming request; it just
+                // prefills normally, exactly as it would have without this feature.
+                return false;
+            }
+        }
+        return false;
     }
 
     // Measurement-only: records how much leading-token prefix `admitted` shares with the other
