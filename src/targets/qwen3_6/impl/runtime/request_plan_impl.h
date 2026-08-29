@@ -349,7 +349,9 @@ RequestPlan ProgramImplCore::plan_ram_reuse(const PreparedPromptData& prompt,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
-    if (!kv_ram_cache_ || !base.allow_prefix_reuse || !prompt.identity.reusable) {
+    // ram_tier_usable() is false while the hyperquant exact-key side store is in use, because a
+    // record cannot describe it -- see the comment on ProgramImplCore::ram_tier_usable.
+    if (!ram_tier_usable() || !base.allow_prefix_reuse || !prompt.identity.reusable) {
         finish_request_plan(*plan, nullptr, prompt, base);
         return RequestPlan(std::move(plan));
     }

@@ -575,7 +575,11 @@ std::optional<RamMatch> KVRamCache::plan_match(const PreparedPromptData& prompt,
         const bool frontier_hash =
             record.execution_frontier > 0 && record.execution_frontier < hash_chain.size() &&
             hash_chain[record.execution_frontier] == record.hash_f;
-        if (!frontier_hash) { continue; }
+        const bool checkpoint_hash =
+            record.hash_c_valid && record.checkpoint_frontier > 0 &&
+            record.checkpoint_frontier < hash_chain.size() &&
+            hash_chain[record.checkpoint_frontier] == record.hash_c;
+        if (!frontier_hash && !checkpoint_hash) { continue; }
 
         const HeaderView header = read_header(record.block, record.bytes);
         const RamRestoredHost host = host_from_header(record.block, header);
@@ -586,19 +590,13 @@ std::optional<RamMatch> KVRamCache::plan_match(const PreparedPromptData& prompt,
                 candidate.reuse_base = record.execution_frontier;
             }
         }
-        // Rewrite-checkpoint restores are deliberately NOT offered from a host-RAM record.
-        // Restoring one returns another request response: the record selected is provably the
-        // right one (its ledger and identity verify token-for-token against the prompt over the
-        // whole checkpoint frontier) and every checkpoint section is present in the entry, yet
-        // the state that reaches the lane belongs to a different request. The defect is
-        // deterministic -- it reproduces with strictly sequential traffic and survives a full
-        // stream synchronise after the capture copies, so it is neither a concurrency race nor a
-        // copy-ordering problem -- and it predates the host-RAM sibling work (it reproduces
-        // unchanged on aa8b5dd7). Until the packed checkpoint state itself is understood, a
-        // missed cache hit costs latency whereas a wrong hit answers one request with another
-        // request context, so this path stays closed. The equivalent VRAM-resident restore is
-        // unaffected and still serves same-conversation replay; append-at-frontier reuse, which
-        // is the common and valuable host-RAM path, is untouched below.
+        if (candidate.reuse_base == 0 && checkpoint_hash) {
+            ++exact_comparisons_;
+            if (prefix_matches(prompt, host.ledger, host.identity, record.checkpoint_frontier)) {
+                candidate.reuse      = record.checkpoint_path;
+                candidate.reuse_base = record.checkpoint_frontier;
+            }
+        }
         if (candidate.reuse_base == 0) { continue; }
         if (!best || candidate.reuse_base > best->reuse_base) { best = candidate; }
     }

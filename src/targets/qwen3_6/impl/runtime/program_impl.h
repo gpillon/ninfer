@@ -1028,8 +1028,27 @@ ProgramImplCore::ram_capture_source_unchecked(const SequenceState& sequence) {
     return source;
 }
 
+// A host-RAM record describes a sequence completely only when the paged KV store holds the whole
+// of it. The hyperquant KV dtypes keep, alongside the quantised pages, an exact-key side store
+// (kGqaHqSinkKeys sink rows plus a kGqaHqRecentKeys recent ring, PagedKVCache::residual_k_/
+// residual_v_/ring_valid_) that is indexed by block-table row, not by sequence -- and a record
+// carries no section for it. Restoring a record therefore binds a freshly acquired row whose side
+// store still holds whatever sequence used that row last, and the decode kernel reads it: the
+// sink rows unconditionally (gqa_attention_decode_bf16.cuh has no validity gate for key <
+// kGqaHqSinkKeys) and the recent window wherever revalidate_residual_ring left a slot marked
+// valid -- which it does off the record's own frontier, as though the row held this sequence's
+// history. The restored request then attends to another request's exact keys. Measured: a prompt
+// answering "ZAFFIRO" when prefilled cold answers "Nessuna" when served through an
+// append-at-frontier host-RAM restore, and a checkpoint restore returned a filler request's reply
+// verbatim. So the RAM tier stays off entirely while the side store is in use; bf16/int8 KV has
+// no side store and keeps full host-RAM reuse. Capturing residual_k/residual_v/ring_valid into
+// the record (~25 MiB on top of ~500 MiB) is the real cure and is left as follow-up work.
+bool ProgramImplCore::ram_tier_usable() const noexcept {
+    return kv_ram_cache_.has_value() && !decoder->text_kv.residual_enabled();
+}
+
 bool ProgramImplCore::capture_retained_lane(std::uint32_t lane) {
-    if (!kv_ram_cache_ || !has_retained_lane(lane)) { return true; }
+    if (!ram_tier_usable() || !has_retained_lane(lane)) { return true; }
     return kv_ram_cache_->capture(ram_capture_source(sequences[lane]));
 }
 
@@ -1046,7 +1065,7 @@ bool ProgramImplCore::capture_active_lane_for_siblings(std::uint32_t lane) {
 }
 
 std::uint32_t ProgramImplCore::active_lane_sibling_base(std::uint32_t lane) const noexcept {
-    if (!kv_ram_cache_ || lane >= max_concurrency) { return 0; }
+    if (!ram_tier_usable() || lane >= max_concurrency) { return 0; }
     const SequenceState& sequence = sequences[lane];
     // A sibling can only resume this lane's state at a frontier where the recurrent (GDN) state
     // has a checkpoint snapshot -- arbitrary mid-prompt frontiers are not resumable. The rewrite

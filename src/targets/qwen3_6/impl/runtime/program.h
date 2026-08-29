@@ -246,6 +246,9 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    // False while a KV dtype keeps an exact-key side store the record cannot carry, so no
+    // host-RAM record is ever captured or matched in that configuration.
+    [[nodiscard]] bool ram_tier_usable() const noexcept;
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
     // Speculative snapshot of a lane that has just finished prefill and is still actively
     // serving its own request (not retained/reclaimable) -- see kv_ram_cache.h's
