@@ -509,14 +509,14 @@ void KVRamCache::evict_unpinned() {
     // available, so capture() is still guaranteed forward progress.
     for (std::uint64_t id : fifo_) {
         const auto it = records_.find(id);
-        if (it != records_.end() && !it->second.pinned && !it->second.protected_tier) {
+        if (it != records_.end() && it->second.claims == 0 && !it->second.protected_tier) {
             destroy_record(id, true);
             return;
         }
     }
     for (std::uint64_t id : fifo_) {
         const auto it = records_.find(id);
-        if (it != records_.end() && !it->second.pinned) {
+        if (it != records_.end() && it->second.claims == 0) {
             destroy_record(id, true);
             return;
         }
@@ -525,28 +525,30 @@ void KVRamCache::evict_unpinned() {
 
 void KVRamCache::claim(std::uint64_t entry_id) {
     Record& record = require(entry_id);
-    if (record.pinned) { throw std::logic_error("RAM cache entry is already claimed"); }
-    record.pinned = true;
+    if (record.claims != 0 && !record.multi_claim) {
+        throw std::logic_error("RAM cache entry is already claimed");
+    }
+    ++record.claims;
     bump_version();
 }
 
 void KVRamCache::release(std::uint64_t entry_id) {
     Record& record = require(entry_id);
-    if (!record.pinned) { throw std::logic_error("RAM cache entry is not claimed"); }
-    record.pinned = false;
+    if (record.claims == 0) { throw std::logic_error("RAM cache entry is not claimed"); }
+    --record.claims;
     bump_version();
 }
 
 void KVRamCache::consume(std::uint64_t entry_id) {
     Record& record = require(entry_id);
-    if (!record.pinned) { throw std::logic_error("RAM cache consume requires a claimed entry"); }
+    if (record.claims == 0) { throw std::logic_error("RAM cache consume requires a claimed entry"); }
     ++restores_;
     note_lineage_hit(record.origin_hash);
+    --record.claims;
     if (record.multi_claim) {
-        // Another sibling may still want to restore from this same entry -- release the claim
-        // (it becomes matchable again via plan_match) instead of erasing it. It ages out through
-        // ordinary FIFO/tiered eviction like any other record once nothing claims it further.
-        record.pinned = false;
+        // Another sibling may still want to restore from this same entry -- drop this claim but
+        // keep the record, which stays matchable throughout. It ages out through ordinary
+        // FIFO/tiered eviction like any other record once nothing claims it further.
         bump_version();
         return;
     }
@@ -562,7 +564,12 @@ std::optional<RamMatch> KVRamCache::plan_match(const PreparedPromptData& prompt,
     std::optional<RamMatch> best;
     for (std::uint64_t id : fifo_) {
         const Record& record = require(id);
-        if (record.pinned) { continue; }
+        // A claimed exclusive record is spoken for and vanishes on its claimant's restore. A
+        // multi_claim record stays matchable while claimed: several siblings of one burst
+        // legitimately restore from the same snapshot, and hiding it from the ones that arrive
+        // while a first claim is outstanding is what used to make each of them capture its own
+        // duplicate of the same lane.
+        if (record.claims != 0 && !record.multi_claim) { continue; }
         RamMatch candidate;
         candidate.entry_id = id;
         const bool frontier_hash =

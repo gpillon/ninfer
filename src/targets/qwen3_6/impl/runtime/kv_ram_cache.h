@@ -168,7 +168,11 @@ private:
         PrefixReusePath checkpoint_path = PrefixReusePath::RestoreTurnCheckpoint;
         void* block                    = nullptr;
         std::size_t bytes              = 0;
-        bool pinned                    = false;
+        // Outstanding claims. An ordinary record admits exactly one claimant at a time (claim()
+        // rejects a second), preserving the original exclusive capture/match/consume lifecycle.
+        // A multi_claim record admits several concurrently, so a burst of siblings all restore
+        // from one snapshot instead of each capturing its own duplicate of the same lane.
+        std::uint32_t claims           = 0;
         bool copies_timed              = false;
         cudaEvent_t copies_start       = nullptr;
         cudaEvent_t copies_done        = nullptr;

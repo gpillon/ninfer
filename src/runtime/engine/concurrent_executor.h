@@ -308,6 +308,12 @@ private:
         std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions{};
         std::optional<Plan> ram_plan;
         std::uint64_t ram_index_version = 0;
+        // Per lane, the sibling-snapshot base this request has already tried to capture. An
+        // attempt that did not end in reuse (the capture failed, or the resulting record was
+        // rejected by the exact-match verification) must not be retried against the same
+        // snapshot point: find_admission_lane runs about once per decode round, so an
+        // unconditional retry would re-capture, re-hash and re-plan on every one of them.
+        std::array<std::uint32_t, kMaximumConcurrency> sibling_capture_bases{};
         AdmissionResources admission_resources;
         std::uint64_t remaining_service_work = 0;
         std::uint64_t backfill_epoch         = 0;
@@ -1054,6 +1060,7 @@ private:
                 base > data.token_ids.size()) {
                 continue;
             }
+            if (request->sibling_capture_bases[lane] == base) { continue; }
             const std::span<const TokenId> lane_tokens =
                 instance_.program->active_lane_tokens(lane);
             if (lane_tokens.size() < base ||
@@ -1061,6 +1068,7 @@ private:
                             data.token_ids.begin())) {
                 continue;
             }
+            request->sibling_capture_bases[lane] = base;
             try {
                 if (instance_.program->capture_active_lane_for_siblings(lane)) { return true; }
             } catch (...) {

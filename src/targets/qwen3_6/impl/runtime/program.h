@@ -249,7 +249,8 @@ public:
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
     // Speculative snapshot of a lane that has just finished prefill and is still actively
     // serving its own request (not retained/reclaimable) -- see kv_ram_cache.h's
-    // RamCaptureSource::multi_claim. No-op (returns true) if the RAM tier is disabled.
+    // RamCaptureSource::multi_claim. Returns false when the RAM tier is disabled or the lane has
+    // nothing resumable to snapshot.
     [[nodiscard]] bool capture_active_lane_for_siblings(std::uint32_t lane);
     // The frontier at which a sibling request could resume this actively-serving lane's state
     // (its rewrite-checkpoint frontier, in practice the prompt/response boundary), or 0 when the
