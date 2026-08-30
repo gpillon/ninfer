@@ -313,6 +313,13 @@ private:
         // cache-state change; invariant/CUDA failures propagate.
         std::array<std::uint32_t, kMaximumConcurrency> sibling_capture_bases{};
         std::array<std::uint64_t, kMaximumConcurrency> sibling_capture_versions{};
+        // Set by maybe_capture_boundary when the winning candidate this tick is a
+        // SourcePrefillBoundary: a frontier partway through this request's own prefill that other
+        // pending requests share, chosen for aggregate benefit rather than any single LCP. Applied
+        // to the winning plan in admit_planned_request via RequestPlan::set_shared_capture_boundary.
+        // Overwritten (not accumulated) on every find_admission_lane call for this request, since
+        // the pending queue -- and therefore the best boundary -- can change between attempts.
+        std::optional<std::uint32_t> boundary_capture_frontier;
         AdmissionResources admission_resources;
         std::uint64_t remaining_service_work = 0;
         std::uint64_t backfill_epoch         = 0;
@@ -813,10 +820,7 @@ private:
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         ensure_ram_candidate(request);
-        if (maybe_capture_sibling_source(request,
-                                         request->ram_plan
-                                             ? request->ram_plan->summary().reusable_prompt_tokens
-                                             : 0U)) {
+        if (maybe_capture_boundary(request)) {
             // The capture bumped the KVRamCache index version, so this re-plans against the
             // just-published sibling snapshot instead of reusing the cached (pre-capture) plan.
             ensure_ram_candidate(request);
@@ -1038,6 +1042,14 @@ private:
             }
             release_planning_state(request);
 
+            // Bake in the dynamic boundary chosen (if any) by maybe_capture_boundary against the
+            // plan that actually won admission -- it may have a different reuse_base than the one
+            // the boundary was scored against, so this validates internally and is a silent no-op
+            // if the frontier no longer lies strictly inside the reusable suffix.
+            if (request->boundary_capture_frontier) {
+                selected_plan.set_shared_capture_boundary(*request->boundary_capture_frontier);
+            }
+
             const RequestPlanSummary summary = selected_plan.summary();
             if (backfill_class == BackfillClass::Temporal) {
                 if (!protection_ || protection_->epoch_id != backfill_epoch ||
@@ -1108,52 +1120,163 @@ private:
         }
     }
 
-    // On-demand snapshot of an actively-decoding lane into the host-RAM cache, triggered from
-    // the SIBLING's admission (find_admission_lane) rather than from the source's prefill
-    // completion. At the source-side trigger point the sibling has typically not yet cleared its
-    // own HTTP-receive/tokenize pipeline into pending_, so a source-side check races and loses;
-    // at admission time the sibling is by definition present and the source lane's state is
-    // directly readable on this same worker thread -- no race, no deferral machinery. The
-    // capture (~30-50ms D2H) is paid only when an active lane offers a resumable checkpoint
-    // (active_lane_sibling_base != 0) whose leading tokens exactly match this request's prompt
-    // beyond a large threshold AND no existing host-RAM candidate already covers as much; the
-    // common non-sharing case pays only the token comparison, which the admission-time
-    // measurement instrumentation already established as cheap. Returns true if a capture was
-    // published (the caller then re-plans against the bumped KVRamCache index).
-    bool maybe_capture_sibling_source(const std::shared_ptr<Request>& request,
-                                      std::uint32_t existing_ram_reuse) {
-        constexpr std::uint32_t kSiblingCaptureThreshold = 2048;
+    // Exact leading-token match length between two token sequences (an LCP), truncated to the
+    // shorter of the two.
+    [[nodiscard]] static std::uint32_t
+    common_prefix_length(std::span<const TokenId> a, std::span<const TokenId> b) noexcept {
+        const auto [mismatch_a, mismatch_b] = std::mismatch(a.begin(), a.end(), b.begin(), b.end());
+        return static_cast<std::uint32_t>(mismatch_a - a.begin());
+    }
+
+    // Single decision point for every host-RAM boundary capture triggered at admission: both a
+    // checkpoint already resident on an actively-decoding lane (ActiveLaneCheckpoint -- the case
+    // the former maybe_capture_sibling_source handled alone) and an LCP-driven frontier partway
+    // through `request`'s own prefill that other pending requests also share
+    // (SourcePrefillBoundary). Evaluating both families together and picking at most one by
+    // aggregate benefit (runtime::choose_boundary_capture) avoids the two ever producing
+    // overlapping records for the same source lane, and picks the candidate that helps the most
+    // pending requests rather than whichever lane happens to come first by index.
+    //
+    // ActiveLaneCheckpoint is captured immediately (same D2H cost and race-free reasoning as
+    // before: the sibling is by definition present at its own admission, and the source lane's
+    // state is directly readable on this same worker thread). SourcePrefillBoundary is not
+    // captured here -- it only sets request->boundary_capture_frontier, which
+    // admit_planned_request later hands to the winning plan via
+    // RequestPlan::set_shared_capture_boundary; the Program lands a chunk on it and captures
+    // during this request's own prefill.
+    //
+    // Returns true only when an ActiveLaneCheckpoint capture was published (the caller then
+    // re-plans against the bumped KVRamCache index); a SourcePrefillBoundary decision returns
+    // false since nothing was captured yet.
+    bool maybe_capture_boundary(const std::shared_ptr<Request>& request) {
+        // Below this many shared tokens a capture's ~183 MiB fixed cost (GDN recurrent + conv +
+        // hyperquant side store, see kv_ram_cache.h) is not worth it regardless of consumer count;
+        // matches the previous maybe_capture_sibling_source threshold.
+        constexpr std::uint32_t kBoundaryMinimumFrontier = 2048;
+        constexpr std::uint64_t kBoundaryRecordFixedBytes = 183ULL * 1024 * 1024;
+        // hq-e8-2b target + MTP backend side store, ~9216 B/token (see plan doc derivation from
+        // qwen3_6_27b/impl/config.h and PagedKVCache row layout).
+        constexpr std::uint64_t kBoundaryRecordBytesPerToken = 9216;
+
+        request->boundary_capture_frontier.reset();
         if (!request->options.execution.allow_prefix_reuse) { return false; }
-        const targets::qwen3_6::PreparedPromptData& data =
+
+        const std::vector<std::shared_ptr<Request>> queued = pending_snapshot();
+        const targets::qwen3_6::PreparedPromptData& admitted_data =
             targets::qwen3_6::PreparedPromptAccess::view(request->prompt);
-        if (data.token_ids.size() < kSiblingCaptureThreshold) { return false; }
+
+        std::vector<runtime::BoundaryCandidate> candidates;
+        std::vector<runtime::BoundaryConsumer> consumers;
+
+        // Family A: a checkpoint already resident on an actively-decoding lane.
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             const std::uint32_t base = instance_.program->active_lane_sibling_base(lane);
-            if (base < kSiblingCaptureThreshold || base <= existing_ram_reuse ||
-                base > data.token_ids.size()) {
-                continue;
-            }
+            if (base < kBoundaryMinimumFrontier) { continue; }
             const std::uint64_t capture_version = instance_.program->kv_ram_index_version();
             if (request->sibling_capture_bases[lane] == base &&
                 request->sibling_capture_versions[lane] == capture_version) {
+                // Already attempted at this exact base against the current cache state -- retrying
+                // would repeat a capacity-pressure failure for free (a real invariant failure
+                // propagates instead of landing here).
                 continue;
             }
-            const std::span<const TokenId> lane_tokens =
-                instance_.program->active_lane_tokens(lane);
-            if (lane_tokens.size() < base ||
-                !std::equal(lane_tokens.begin(), lane_tokens.begin() + base,
-                            data.token_ids.begin())) {
-                continue;
+            const std::span<const TokenId> lane_tokens = instance_.program->active_lane_tokens(lane);
+            if (lane_tokens.size() < base) { continue; }
+            const std::span<const TokenId> lane_prefix = lane_tokens.subspan(0, base);
+
+            const std::size_t consumer_begin = consumers.size();
+            consumers.push_back(runtime::BoundaryConsumer{
+                .common_tokens =
+                    common_prefix_length(lane_prefix, std::span<const TokenId>(admitted_data.token_ids)),
+                .already_reused = request->ram_plan
+                                      ? request->ram_plan->summary().reusable_prompt_tokens
+                                      : 0U,
+            });
+            for (const std::shared_ptr<Request>& other : queued) {
+                if (other->id == request->id) { continue; }
+                const targets::qwen3_6::PreparedPromptData& other_data =
+                    targets::qwen3_6::PreparedPromptAccess::view(other->prompt);
+                consumers.push_back(runtime::BoundaryConsumer{
+                    .common_tokens = common_prefix_length(
+                        lane_prefix, std::span<const TokenId>(other_data.token_ids)),
+                    .already_reused = other->ram_plan
+                                          ? other->ram_plan->summary().reusable_prompt_tokens
+                                          : 0U,
+                });
             }
-            const bool captured = instance_.program->capture_active_lane_for_siblings(lane);
-            request->sibling_capture_bases[lane]    = base;
-            request->sibling_capture_versions[lane] =
-                instance_.program->kv_ram_index_version();
-            if (captured) {
-                return true;
+            candidates.push_back(runtime::BoundaryCandidate{
+                .kind           = runtime::BoundaryCaptureKind::ActiveLaneCheckpoint,
+                .lane           = lane,
+                .frontier       = base,
+                .consumer_begin = consumer_begin,
+                .consumer_count = consumers.size() - consumer_begin,
+            });
+        }
+
+        // Family B: an LCP frontier partway through `request`'s own prefill that other pending
+        // requests share. The source gains nothing here -- it only pays the split + D2H -- so it
+        // is never one of this family's consumers.
+        {
+            const std::size_t consumer_begin = consumers.size();
+            std::vector<std::uint32_t> distinct_lcps;
+            const std::uint32_t source_prompt_tokens =
+                static_cast<std::uint32_t>(admitted_data.token_ids.size());
+            for (const std::shared_ptr<Request>& other : queued) {
+                if (other->id == request->id) { continue; }
+                const targets::qwen3_6::PreparedPromptData& other_data =
+                    targets::qwen3_6::PreparedPromptAccess::view(other->prompt);
+                const std::uint32_t common = common_prefix_length(
+                    std::span<const TokenId>(admitted_data.token_ids),
+                    std::span<const TokenId>(other_data.token_ids));
+                consumers.push_back(runtime::BoundaryConsumer{
+                    .common_tokens = common,
+                    .already_reused = other->ram_plan
+                                          ? other->ram_plan->summary().reusable_prompt_tokens
+                                          : 0U,
+                });
+                if (const auto boundary = runtime::source_prefill_capture_frontier(
+                        common, source_prompt_tokens, kBoundaryMinimumFrontier)) {
+                    distinct_lcps.push_back(*boundary);
+                }
+            }
+            const std::size_t consumer_count = consumers.size() - consumer_begin;
+            std::sort(distinct_lcps.begin(), distinct_lcps.end());
+            distinct_lcps.erase(std::unique(distinct_lcps.begin(), distinct_lcps.end()),
+                               distinct_lcps.end());
+            for (std::uint32_t lcp : distinct_lcps) {
+                candidates.push_back(runtime::BoundaryCandidate{
+                    .kind           = runtime::BoundaryCaptureKind::SourcePrefillBoundary,
+                    .lane           = 0,
+                    .frontier       = lcp,
+                    .consumer_begin = consumer_begin,
+                    .consumer_count = consumer_count,
+                });
             }
         }
+
+        if (candidates.empty()) { return false; }
+
+        const auto ram = instance_.program->kv_ram_snapshot();
+        const runtime::BoundaryCaptureBudget budget{
+            .record_fixed_bytes     = kBoundaryRecordFixedBytes,
+            .record_bytes_per_token = kBoundaryRecordBytesPerToken,
+            .ram_free_bytes = ram.capacity_bytes > ram.used_bytes ? ram.capacity_bytes - ram.used_bytes
+                                                                  : 0ULL,
+            .minimum_frontier = kBoundaryMinimumFrontier,
+        };
+        const std::optional<runtime::BoundaryCandidate> chosen =
+            runtime::choose_boundary_capture(candidates, consumers, budget);
+        if (!chosen) { return false; }
+
+        if (chosen->kind == runtime::BoundaryCaptureKind::ActiveLaneCheckpoint) {
+            const bool captured = instance_.program->capture_active_lane_for_siblings(chosen->lane);
+            request->sibling_capture_bases[chosen->lane]    = chosen->frontier;
+            request->sibling_capture_versions[chosen->lane] =
+                instance_.program->kv_ram_index_version();
+            return captured;
+        }
+        request->boundary_capture_frontier = chosen->frontier;
         return false;
     }
 

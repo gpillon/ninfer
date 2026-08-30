@@ -181,6 +181,131 @@ int main() {
     retained[1].reserved_for_earlier_main = true;
     failures += check(!ninfer::runtime::choose_retained_lane_victim(retained).has_value(),
                       "pending-main reservations did not pin all matching retained lanes");
+    using ninfer::runtime::BoundaryCandidate;
+    using ninfer::runtime::BoundaryCaptureBudget;
+    using ninfer::runtime::BoundaryCaptureKind;
+    using ninfer::runtime::BoundaryConsumer;
+    using ninfer::runtime::choose_boundary_capture;
+    using ninfer::runtime::source_prefill_capture_frontier;
+
+    const BoundaryCaptureBudget generous_budget{
+        .record_fixed_bytes     = 183ULL * 1024 * 1024,
+        .record_bytes_per_token = 9216,
+        .ram_free_bytes         = 8ULL * 1024 * 1024 * 1024,
+        .minimum_frontier       = 2048,
+    };
+
+    {
+        const auto identical = source_prefill_capture_frontier(8192, 8192, 2048);
+        failures += check(identical.has_value() && *identical == 8191,
+                          "identical prompts did not select the final valid source boundary");
+        const auto shorter_consumer = source_prefill_capture_frontier(4096, 8192, 2048);
+        failures += check(shorter_consumer.has_value() && *shorter_consumer == 4096,
+                          "shorter shared prefix changed the valid capture frontier");
+        failures += check(!source_prefill_capture_frontier(1, 1, 1).has_value(),
+                          "single-token prompt produced an impossible capture boundary");
+    }
+
+    {
+        // One consumer shares 20k, five consumers share 11k: the 11k boundary saves
+        // 5 * (11000 - 0) = 55000 aggregate tokens vs 20000 for the 20k boundary alone.
+        std::array<BoundaryConsumer, 6> consumers{
+            BoundaryConsumer{.common_tokens = 20000, .already_reused = 0},
+            BoundaryConsumer{.common_tokens = 11000, .already_reused = 0},
+            BoundaryConsumer{.common_tokens = 11000, .already_reused = 0},
+            BoundaryConsumer{.common_tokens = 11000, .already_reused = 0},
+            BoundaryConsumer{.common_tokens = 11000, .already_reused = 0},
+            BoundaryConsumer{.common_tokens = 11000, .already_reused = 0},
+        };
+        std::array<BoundaryCandidate, 2> candidates{
+            BoundaryCandidate{.kind               = BoundaryCaptureKind::SourcePrefillBoundary,
+                              .frontier           = 20000,
+                              .consumer_begin     = 0,
+                              .consumer_count     = consumers.size()},
+            BoundaryCandidate{.kind               = BoundaryCaptureKind::SourcePrefillBoundary,
+                              .frontier           = 11000,
+                              .consumer_begin     = 0,
+                              .consumer_count     = consumers.size()},
+        };
+        const auto chosen = choose_boundary_capture(candidates, consumers, generous_budget);
+        failures += check(chosen.has_value() && chosen->frontier == 11000,
+                          "aggregate benefit did not prefer the boundary shared by more consumers");
+    }
+
+    {
+        // A consumer whose plan already reuses up to the frontier contributes nothing new.
+        std::array<BoundaryConsumer, 1> consumers{
+            BoundaryConsumer{.common_tokens = 5000, .already_reused = 5000},
+        };
+        std::array<BoundaryCandidate, 1> candidates{
+            BoundaryCandidate{.kind           = BoundaryCaptureKind::SourcePrefillBoundary,
+                              .frontier       = 5000,
+                              .consumer_begin = 0,
+                              .consumer_count = consumers.size()},
+        };
+        failures += check(
+            !choose_boundary_capture(candidates, consumers, generous_budget).has_value(),
+            "a consumer already covered by an existing plan should not justify a new capture");
+    }
+
+    {
+        // Insufficient RAM budget rejects an otherwise-scoring candidate rather than forcing
+        // an eviction for a speculative capture.
+        std::array<BoundaryConsumer, 1> consumers{
+            BoundaryConsumer{.common_tokens = 11000, .already_reused = 0},
+        };
+        std::array<BoundaryCandidate, 1> candidates{
+            BoundaryCandidate{.kind           = BoundaryCaptureKind::SourcePrefillBoundary,
+                              .frontier       = 11000,
+                              .consumer_begin = 0,
+                              .consumer_count = consumers.size()},
+        };
+        BoundaryCaptureBudget tight_budget = generous_budget;
+        tight_budget.ram_free_bytes        = 10ULL * 1024 * 1024;
+        failures += check(
+            !choose_boundary_capture(candidates, consumers, tight_budget).has_value(),
+            "a capture whose fixed+variable cost exceeds free RAM should be rejected");
+    }
+
+    {
+        // Every candidate below the noise floor is rejected outright.
+        std::array<BoundaryConsumer, 1> consumers{
+            BoundaryConsumer{.common_tokens = 1000, .already_reused = 0},
+        };
+        std::array<BoundaryCandidate, 1> candidates{
+            BoundaryCandidate{.kind           = BoundaryCaptureKind::SourcePrefillBoundary,
+                              .frontier       = 1000,
+                              .consumer_begin = 0,
+                              .consumer_count = consumers.size()},
+        };
+        failures += check(
+            !choose_boundary_capture(candidates, consumers, generous_budget).has_value(),
+            "a boundary below the minimum frontier should never be selected");
+    }
+
+    {
+        // Equal aggregate score (12000 each) prefers the cheaper (smaller) frontier.
+        std::array<BoundaryConsumer, 3> consumers{
+            BoundaryConsumer{.common_tokens = 6000, .already_reused = 0},
+            BoundaryConsumer{.common_tokens = 6000, .already_reused = 0},
+            BoundaryConsumer{.common_tokens = 12000, .already_reused = 0},
+        };
+        std::array<BoundaryCandidate, 2> candidates{
+            BoundaryCandidate{.kind           = BoundaryCaptureKind::SourcePrefillBoundary,
+                              .frontier       = 6000,
+                              .consumer_begin = 0,
+                              .consumer_count = 2},
+            BoundaryCandidate{.kind           = BoundaryCaptureKind::ActiveLaneCheckpoint,
+                              .lane           = 2,
+                              .frontier       = 12000,
+                              .consumer_begin = 2,
+                              .consumer_count = 1},
+        };
+        const auto chosen = choose_boundary_capture(candidates, consumers, generous_budget);
+        failures +=
+            check(chosen.has_value() && chosen->frontier == 6000, "tie-break lost the smaller frontier");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

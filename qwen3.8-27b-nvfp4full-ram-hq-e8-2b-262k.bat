@@ -34,10 +34,10 @@ echo [qwen3.8-27b-nvfp4full-hq-e8-2b-262k] vision + MTP3, native 262144 context,
   --pending-timeout-ms 3000000 ^
   --kv-dtype hq-e8-2b ^
   --max-context 262144 ^
-  --max-concurrency 4 ^
+  --max-concurrency 8 ^
   --adaptive-mtp ^
   --kv-ram-capacity 8192 ^
-  --kv-capacity 450000 ^
+  --kv-capacity auto ^
   --max-pending-requests 50 ^
   %*
 

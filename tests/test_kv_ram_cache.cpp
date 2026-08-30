@@ -223,13 +223,14 @@ ninfer::targets::qwen3_6::PreparedPromptData text_prompt(std::vector<ninfer::Tok
     return prompt;
 }
 
-int capture_text_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
-                       ninfer::PagedKVPool& pool, ninfer::PagedKVAllocation& alloc,
-                       const ninfer::targets::qwen3_6::PreparedPromptData& prompt,
-                       cudaStream_t stream, std::uint32_t checkpoint_frontier = 0,
-                       std::uint32_t capture_pages = std::numeric_limits<std::uint32_t>::max(),
-                       bool multi_claim = false,
-                       ninfer::RequestClass owner_class = ninfer::RequestClass::Agents) {
+int capture_text_entry(
+    ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::PagedKVPool& pool,
+    ninfer::PagedKVAllocation& alloc, const ninfer::targets::qwen3_6::PreparedPromptData& prompt,
+    cudaStream_t stream, std::uint32_t checkpoint_frontier = 0,
+    std::uint32_t capture_pages = std::numeric_limits<std::uint32_t>::max(),
+    bool multi_claim = false, ninfer::RequestClass owner_class = ninfer::RequestClass::Agents,
+    ninfer::targets::qwen3_6::detail::RamCaptureKind capture_kind =
+        ninfer::targets::qwen3_6::detail::RamCaptureKind::Terminal) {
     ninfer::targets::qwen3_6::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
@@ -268,6 +269,7 @@ int capture_text_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
     source.stream    = stream;
     source.multi_claim = multi_claim;
     source.owner_class = owner_class;
+    source.capture_kind = capture_kind;
     return cache.capture(source) ? 0 : 1;
 }
 
@@ -743,6 +745,129 @@ int test_persistent_promotion_and_class_eviction(ninfer::DeviceContext& ctx,
                !classes.plan_match(prompt_c, chain_c)) {
         ++failures;
         std::cerr << "class-aware eviction did not preserve main over classifier\n";
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    return failures;
+}
+
+// The dynamic-boundary capture (the LCP-driven checkpoint chosen by admission's boundary policy)
+// has no demotion path once consume() promotes it, so its live count must be capped independently
+// of ordinary byte-capacity pressure -- otherwise every burst leaves behind a permanently
+// protected record. This pins: (1) a third capture evicts the coldest one even with room to spare,
+// (2) a touched (recently hit) record survives over an untouched one of the same age, (3) a cap
+// with every existing record claimed fails the capture cleanly instead of forcing an eviction.
+int test_dynamic_boundary_cap(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    int failures  = 0;
+    auto source   = pool.reserve(1);
+    source.materialize_pages(1, ctx.stream);
+    fill_logical_pages(pool, source, 71);
+    const auto prompt_a = text_prompt({701, 702, 703, 704});
+    const auto prompt_b = text_prompt({801, 802, 803, 804});
+    const auto prompt_c = text_prompt({901, 902, 903, 904});
+    const auto chain_a  = q36::detail::prefix_hash_chain(prompt_a);
+    const auto chain_b  = q36::detail::prefix_hash_chain(prompt_b);
+    const auto chain_c  = q36::detail::prefix_hash_chain(prompt_c);
+
+    q36::detail::KVRamCache size_probe(8ULL << 20);
+    if (capture_text_entry(size_probe, pool, source, prompt_a, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Agents, q36::detail::RamCaptureKind::DynamicBoundary) !=
+        0) {
+        return fail("dynamic-boundary cap size probe failed");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    const std::size_t prefix_bytes = size_probe.snapshot().used_bytes;
+
+    // (1) Ample room for all three; the cap (not byte pressure) must still evict the oldest.
+    q36::detail::KVRamCache capped(prefix_bytes * 4 + 256);
+    if (capture_text_entry(capped, pool, source, prompt_a, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Agents, q36::detail::RamCaptureKind::DynamicBoundary) !=
+            0 ||
+        capture_text_entry(capped, pool, source, prompt_b, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Agents, q36::detail::RamCaptureKind::DynamicBoundary) !=
+            0) {
+        ++failures;
+        std::cerr << "dynamic-boundary cap setup capture failed\n";
+    } else {
+        if (capture_text_entry(capped, pool, source, prompt_c, ctx.stream, 0, 1, false,
+                               ninfer::RequestClass::Agents,
+                               q36::detail::RamCaptureKind::DynamicBoundary) != 0) {
+            ++failures;
+            std::cerr << "third dynamic-boundary capture unexpectedly dropped\n";
+        } else if (capped.plan_match(prompt_a, chain_a) || !capped.plan_match(prompt_b, chain_b) ||
+                   !capped.plan_match(prompt_c, chain_c)) {
+            ++failures;
+            std::cerr << "dynamic-boundary cap did not evict the oldest record\n";
+        }
+    }
+
+    // (2) A, B multi_claim so a consume() hit touches without erasing. Touch A, then a third
+    // capture must evict B (colder), not A.
+    q36::detail::KVRamCache touched(prefix_bytes * 4 + 256);
+    if (capture_text_entry(touched, pool, source, prompt_a, ctx.stream, 0, 1, true,
+                           ninfer::RequestClass::Agents, q36::detail::RamCaptureKind::DynamicBoundary) !=
+            0 ||
+        capture_text_entry(touched, pool, source, prompt_b, ctx.stream, 0, 1, true,
+                           ninfer::RequestClass::Agents, q36::detail::RamCaptureKind::DynamicBoundary) !=
+            0) {
+        ++failures;
+        std::cerr << "dynamic-boundary touch setup capture failed\n";
+    } else {
+        const auto hit = touched.plan_match(prompt_a, chain_a);
+        if (!hit) {
+            ++failures;
+            std::cerr << "dynamic-boundary touch source did not match\n";
+        } else {
+            touched.claim(hit->entry_id);
+            touched.consume(hit->entry_id);
+            if (capture_text_entry(touched, pool, source, prompt_c, ctx.stream, 0, 1, false,
+                                   ninfer::RequestClass::Agents,
+                                   q36::detail::RamCaptureKind::DynamicBoundary) != 0) {
+                ++failures;
+                std::cerr << "post-touch dynamic-boundary capture unexpectedly dropped\n";
+            } else if (!touched.plan_match(prompt_a, chain_a) ||
+                       touched.plan_match(prompt_b, chain_b) ||
+                       !touched.plan_match(prompt_c, chain_c)) {
+                ++failures;
+                std::cerr << "touch-on-hit did not protect the more recently used record\n";
+            }
+        }
+    }
+
+    // (3) Cap met and both existing records claimed: the capture must fail cleanly, not force an
+    // eviction of state still in use.
+    q36::detail::KVRamCache claimed(prefix_bytes * 4 + 256);
+    if (capture_text_entry(claimed, pool, source, prompt_a, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Agents, q36::detail::RamCaptureKind::DynamicBoundary) !=
+            0 ||
+        capture_text_entry(claimed, pool, source, prompt_b, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Agents, q36::detail::RamCaptureKind::DynamicBoundary) !=
+            0) {
+        ++failures;
+        std::cerr << "dynamic-boundary claimed-cap setup capture failed\n";
+    } else {
+        const auto match_a = claimed.plan_match(prompt_a, chain_a);
+        const auto match_b = claimed.plan_match(prompt_b, chain_b);
+        if (!match_a || !match_b) {
+            ++failures;
+            std::cerr << "dynamic-boundary claimed-cap setup did not match both records\n";
+        } else {
+            claimed.claim(match_a->entry_id);
+            claimed.claim(match_b->entry_id);
+            const std::size_t before_drops = claimed.snapshot().drops;
+            if (capture_text_entry(claimed, pool, source, prompt_c, ctx.stream, 0, 1, false,
+                                   ninfer::RequestClass::Agents,
+                                   q36::detail::RamCaptureKind::DynamicBoundary) == 0 ||
+                claimed.snapshot().drops == before_drops ||
+                claimed.snapshot().entry_count != 2) {
+                ++failures;
+                std::cerr << "fully claimed dynamic-boundary cap forced an eviction instead of "
+                             "dropping the new capture\n";
+            }
+            claimed.release(match_a->entry_id);
+            claimed.release(match_b->entry_id);
+        }
     }
 
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
@@ -1858,6 +1983,7 @@ int main() {
     failures += test_kv_ram_index(ctx, paged_pool);
     failures += test_capture_extent_and_eviction_policy(ctx, paged_pool);
     failures += test_persistent_promotion_and_class_eviction(ctx, paged_pool);
+    failures += test_dynamic_boundary_cap(ctx, paged_pool);
     failures += test_unpack_consume_and_drop(ctx, paged_pool);
     failures += test_frontier_beats_checkpoint(ctx, paged_pool);
     failures += test_asymmetric_fifo(ctx, paged_pool);

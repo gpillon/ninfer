@@ -195,4 +195,45 @@ bool protected_head_safe_without_temporal(const AdmissionProtection& protection,
     return fits(used, capacity);
 }
 
+std::optional<BoundaryCandidate> choose_boundary_capture(
+    std::span<const BoundaryCandidate> candidates, std::span<const BoundaryConsumer> consumers,
+    const BoundaryCaptureBudget& budget) noexcept {
+    const BoundaryCandidate* best = nullptr;
+    std::uint64_t best_score      = 0;
+    for (const BoundaryCandidate& candidate : candidates) {
+        if (candidate.kind == BoundaryCaptureKind::None) { continue; }
+        if (candidate.frontier < budget.minimum_frontier) { continue; }
+        const std::uint64_t cost =
+            budget.record_fixed_bytes +
+            static_cast<std::uint64_t>(candidate.frontier) * budget.record_bytes_per_token;
+        if (cost > budget.ram_free_bytes) { continue; }
+        if (candidate.consumer_begin > consumers.size() ||
+            candidate.consumer_count > consumers.size() - candidate.consumer_begin) {
+            continue;
+        }
+        std::uint64_t score = 0;
+        for (std::size_t i = 0; i < candidate.consumer_count; ++i) {
+            const BoundaryConsumer& consumer = consumers[candidate.consumer_begin + i];
+            if (consumer.common_tokens < candidate.frontier) { continue; }
+            if (candidate.frontier <= consumer.already_reused) { continue; }
+            score += candidate.frontier - consumer.already_reused;
+        }
+        if (score == 0) { continue; }
+        if (best == nullptr || score > best_score ||
+            (score == best_score && candidate.frontier < best->frontier)) {
+            best       = &candidate;
+            best_score = score;
+        }
+    }
+    return best != nullptr ? std::optional<BoundaryCandidate>(*best) : std::nullopt;
+}
+
+std::optional<std::uint32_t>
+source_prefill_capture_frontier(std::uint32_t common_tokens, std::uint32_t source_prompt_tokens,
+                                std::uint32_t minimum_frontier) noexcept {
+    if (source_prompt_tokens < 2) { return std::nullopt; }
+    const std::uint32_t frontier = std::min(common_tokens, source_prompt_tokens - 1U);
+    return frontier >= minimum_frontier ? std::optional<std::uint32_t>(frontier) : std::nullopt;
+}
+
 } // namespace ninfer::runtime

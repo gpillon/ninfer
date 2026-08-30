@@ -86,6 +86,11 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
+    // Set post-hoc by RequestPlan::set_shared_capture_boundary once admission's boundary-capture
+    // policy (runtime::choose_boundary_capture) has chosen an LCP-driven frontier for this plan's
+    // prefill to land a chunk on and snapshot, distinct from the request's own static
+    // system+tools boundary (prompt.identity.shared_prefix_frontier).
+    std::optional<std::uint32_t> shared_capture_boundary;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -201,6 +206,7 @@ struct RequestControl {
         std::unique_ptr<schedule::VisionPrefillSession> vision;
         runtime::TransientRegion transient;
         std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture;
+        std::optional<std::uint32_t> shared_capture_boundary;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;
@@ -262,12 +268,16 @@ public:
     // RamCaptureSource::multi_claim. Returns false when the RAM tier is disabled or the lane has
     // nothing resumable to snapshot.
     [[nodiscard]] bool capture_active_lane_for_siblings(std::uint32_t lane);
-    // Snapshot a prefill that has just crossed its prompt's shared system/tools boundary into the
-    // host cache, so the other agents of the same burst resume that region instead of each
-    // recomputing it. Reads the live GDN slot and the KV written so far; the only lane state it
-    // writes is tail_hidden, which this same prefill overwrites at its own finalization.
+    // Snapshot a prefill that has just crossed a shared boundary into the host cache, so the
+    // other agents of the same burst resume that region instead of each recomputing it. Reads the
+    // live GDN slot and the KV written so far; the only lane state it writes is tail_hidden, which
+    // this same prefill overwrites at its own finalization. `kind` distinguishes the request's own
+    // static system+tools boundary from an admission-chosen dynamic LCP boundary, so the record
+    // carries the right RamCaptureKind for eviction policy (see kv_ram_cache.h).
     void capture_shared_prefix_boundary(SequenceState& sequence, const PreparedPromptData& prompt,
-                                        std::uint32_t frontier);
+                                        std::uint32_t frontier,
+                                        qwen3_6::detail::RamCaptureKind kind =
+                                            qwen3_6::detail::RamCaptureKind::SharedBoundary);
     // The frontier at which a sibling request could resume this actively-serving lane's state
     // (its rewrite-checkpoint frontier, in practice the prompt/response boundary), or 0 when the
     // lane has no such stable resumable point right now. Nonzero also implies

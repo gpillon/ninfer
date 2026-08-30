@@ -23,6 +23,18 @@
 
 namespace ninfer::targets::qwen3_6::detail {
 
+// What produced a capture, for eviction/accounting policy that needs to tell captures apart
+// without inferring it from other fields. Terminal is a settled lane retired into the cache;
+// ActiveSibling and SharedBoundary are the two multi_claim capture sites that existed before the
+// dynamic boundary; DynamicBoundary is the LCP-driven capture chosen by admission's boundary
+// policy (see runtime::choose_boundary_capture) and is the only kind subject to a live-count cap.
+enum class RamCaptureKind : std::uint8_t {
+    Terminal,
+    ActiveSibling,
+    SharedBoundary,
+    DynamicBoundary,
+};
+
 struct RamCaptureSource {
     std::uint32_t execution_frontier      = 0;
     std::uint32_t ledger_frontier         = 0;
@@ -79,6 +91,8 @@ struct RamCaptureSource {
     // an ordinary terminal-lane capture, more than one sibling may legitimately want to restore
     // from the same entry, so it must not be erased after the first restore.
     bool multi_claim = false;
+
+    RamCaptureKind capture_kind = RamCaptureKind::Terminal;
 };
 
 struct RamRestoreTarget {
@@ -219,6 +233,7 @@ private:
         // other record, no special-cased cleanup required.
         bool multi_claim               = false;
         runtime::RequestClass owner_class = runtime::RequestClass::Agents;
+        RamCaptureKind capture_kind    = RamCaptureKind::Terminal;
     };
 
     struct Layout {
@@ -234,6 +249,15 @@ private:
     void note_lineage_hit(std::uint64_t origin_hash);
     void evict_unpinned();
     void destroy_record(std::uint64_t entry_id, bool count_eviction);
+    // Moves entry_id to the back of fifo_ on a demonstrated hit, so eviction (which always walks
+    // fifo_ front-to-back within a rank) reclaims the coldest record of that rank/kind rather than
+    // simply the oldest by capture time.
+    void touch(std::uint64_t entry_id);
+    // Enforces the live-count cap on RamCaptureKind::DynamicBoundary records before a new one is
+    // admitted, evicting the coldest unclaimed one if the cap is already met. Returns false only
+    // when the cap is met and every existing DynamicBoundary record is claimed -- the caller must
+    // then fail the capture rather than force an eviction of state still in use.
+    bool make_room_for_dynamic_boundary();
     void begin_copies(Record& record, cudaStream_t stream);
     void record_copies(Record& record, cudaStream_t stream);
     void wait_copies(Record& record);

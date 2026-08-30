@@ -513,6 +513,39 @@ void KVRamCache::note_lineage_hit(std::uint64_t origin_hash) {
     if (it->second < std::numeric_limits<std::uint32_t>::max()) { ++it->second; }
 }
 
+namespace {
+constexpr std::uint32_t kMaxDynamicBoundaryRecords = 2;
+} // namespace
+
+void KVRamCache::touch(std::uint64_t entry_id) {
+    const auto it = std::find(fifo_.begin(), fifo_.end(), entry_id);
+    if (it == fifo_.end()) { return; }
+    fifo_.erase(it);
+    fifo_.push_back(entry_id);
+}
+
+bool KVRamCache::make_room_for_dynamic_boundary() {
+    std::uint32_t live = 0;
+    for (std::uint64_t id : fifo_) {
+        const auto it = records_.find(id);
+        if (it != records_.end() && it->second.capture_kind == RamCaptureKind::DynamicBoundary) {
+            ++live;
+        }
+    }
+    if (live < kMaxDynamicBoundaryRecords) { return true; }
+    // fifo_ is touched on every hit (see touch()), so the front-most match here is the coldest
+    // unclaimed DynamicBoundary record, not merely the oldest by capture time.
+    for (std::uint64_t id : fifo_) {
+        const auto it = records_.find(id);
+        if (it != records_.end() && it->second.capture_kind == RamCaptureKind::DynamicBoundary &&
+            it->second.claims == 0) {
+            destroy_record(id, true);
+            return true;
+        }
+    }
+    return false;
+}
+
 void KVRamCache::evict_unpinned() {
     // Class is durable across a VRAM spill. Classifier records and unproven non-main records
     // churn first, demonstrated ordinary agent state next, and main conversation state last.
@@ -557,6 +590,7 @@ void KVRamCache::consume(std::uint64_t entry_id) {
     if (record.claims == 0) { throw std::logic_error("RAM cache consume requires a claimed entry"); }
     ++restores_;
     note_lineage_hit(record.origin_hash);
+    touch(entry_id);
     --record.claims;
     if (record.multi_claim) {
         // Another sibling may still want to restore from this same entry -- drop this claim but
@@ -759,6 +793,15 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         bump_version();
         return false;
     }
+    // Enforced only once the entry is known to fit the arena at all -- evicting a live
+    // DynamicBoundary record for a capture that could never succeed regardless (oversized entry,
+    // or a source invariant that would have thrown above) would waste it for nothing.
+    if (source.capture_kind == RamCaptureKind::DynamicBoundary &&
+        !make_room_for_dynamic_boundary()) {
+        ++drops_;
+        bump_version();
+        return false;
+    }
 
     reap_retired(false);
     void* block = arena_.try_alloc(header.entry_bytes, kDeviceAlign);
@@ -886,6 +929,7 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         record.protected_tier      = lineage_is_hot(record.origin_hash);
         record.multi_claim         = source.multi_claim;
         record.owner_class         = source.owner_class;
+        record.capture_kind        = source.capture_kind;
         record.copies_start        = copies_start;
         copies_start               = nullptr;
         const auto [it, inserted]  = records_.emplace(record.id, record);

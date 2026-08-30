@@ -131,6 +131,14 @@ public:
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
 
+    // Records a shared-prefix boundary chosen by admission's boundary-capture policy
+    // (runtime::choose_boundary_capture) for this plan's prefill to land a chunk on and snapshot.
+    // Silently ignored if frontier does not lie strictly between this plan's own reuse_base and
+    // prompt_tokens -- the plan that wins admission can have a different reuse_base than the one
+    // the boundary was scored against. Bumps summary().service_work_quanta by one prefill unit to
+    // account for the extra chunk split this adds to the prefill.
+    void set_shared_capture_boundary(std::uint32_t frontier) noexcept;
+
 public:
     // Family-private construction/storage seam. This header is repository-internal; exact
     // packages expose only the completed alias and never inspect this pointer.

@@ -33,6 +33,9 @@ out/
 models/
 vcpkg_installed/
 *.log
+_bench_logs/
+*.bak
+*.bak-*
 
 # Measurement raw corpora & intermediates (large; produced by offline tooling).
 # The small final frequency stats under fixtures/ranking/ ARE tracked; the rest is ignored.

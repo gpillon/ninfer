@@ -143,6 +143,22 @@ const runtime::RequestPlanSummary& RequestPlan<Variant>::summary() const noexcep
 }
 
 template <>
+void RequestPlan<Variant>::set_shared_capture_boundary(std::uint32_t frontier) noexcept {
+    if (impl_ == nullptr || frontier <= impl_->reuse_base ||
+        frontier >= impl_->summary.prompt_tokens) {
+        return;
+    }
+    impl_->shared_capture_boundary = frontier;
+    // Landing an extra chunk on the boundary costs exactly one more prefill unit, matching how
+    // each split source contributes to projected_service_work's prefill_splits term
+    // (request_plan_impl.h). This may double-count by one unit if the boundary happens to
+    // coincide with an already-counted split (e.g. the request's own static system+tools
+    // frontier); harmless -- this quantum only feeds admission's fairness/backfill accounting,
+    // never correctness.
+    ++impl_->summary.service_work_quanta;
+}
+
+template <>
 Program<Variant>::Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 

@@ -663,6 +663,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .vision                      = nullptr,
             .transient                   = transient,
             .rewrite_checkpoint_capture  = request_plan.rewrite_checkpoint_capture,
+            .shared_capture_boundary     = request_plan.shared_capture_boundary,
             .base                        = base,
             .cursor                      = base,
             .prompt_tokens               = prompt_tokens,
@@ -1068,7 +1069,8 @@ bool ProgramImplCore::capture_retained_lane(std::uint32_t lane) {
 
 void ProgramImplCore::capture_shared_prefix_boundary(SequenceState& sequence,
                                                      const PreparedPromptData& prompt,
-                                                     std::uint32_t frontier) {
+                                                     std::uint32_t frontier,
+                                                     qwen3_6::detail::RamCaptureKind kind) {
     // Vision items can straddle the boundary, and truncating an identity through one would
     // describe a prefix that never existed; media prompts simply skip this optimization.
     if (!kv_ram_cache_ || prompt.has_media() || frontier == 0 ||
@@ -1125,9 +1127,10 @@ void ProgramImplCore::capture_shared_prefix_boundary(SequenceState& sequence,
         source.dflash_local = &dflash->local;
         source.dflash_lane  = static_cast<std::int32_t>(sequence.lane);
     }
-    source.stream      = device.stream;
-    source.multi_claim = true;
-    source.owner_class = sequence.owner_class;
+    source.stream       = device.stream;
+    source.multi_claim  = true;
+    source.owner_class  = sequence.owner_class;
+    source.capture_kind = kind;
     (void)kv_ram_cache_->capture(source);
 }
 
@@ -1184,9 +1187,10 @@ bool ProgramImplCore::capture_active_lane_for_siblings(std::uint32_t lane) {
         source.dflash_local = &dflash->rewrite_checkpoint_local;
         source.dflash_lane  = static_cast<std::int32_t>(sequence.lane);
     }
-    source.stream      = device.stream;
-    source.multi_claim = true;
-    source.owner_class = sequence.owner_class;
+    source.stream       = device.stream;
+    source.multi_claim  = true;
+    source.owner_class  = sequence.owner_class;
+    source.capture_kind = qwen3_6::detail::RamCaptureKind::ActiveSibling;
     return kv_ram_cache_->capture(source);
 }
 
@@ -2096,15 +2100,29 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
 
         if (staged.cursor < staged.prompt_tokens) {
             std::uint32_t nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
-            // Land a chunk exactly on the shared system/tools boundary so its hidden state is this
-            // chunk's last column and the recurrent state is the boundary's, both readable without
-            // disturbing the run. Only a prefill that actually computes that region can snapshot
-            // it: one that resumed at or past the boundary already reused someone else's.
-            const std::uint32_t shared_boundary =
+            // Land a chunk exactly on a shared boundary so its hidden state is this chunk's last
+            // column and the recurrent state is the boundary's, both readable without disturbing
+            // the run. Only a prefill that actually computes that region can snapshot it: one that
+            // resumed at or past the boundary already reused someone else's. Two boundaries can
+            // apply: the request's own static system+tools frontier, and an admission-chosen
+            // dynamic frontier from the real LCP of concurrent prompts (see
+            // runtime::choose_boundary_capture). The dynamic one, when present, is always at or
+            // beyond the static one -- capturing there alone also covers the static boundary, so
+            // only the longer of the two is worth the extra chunk split.
+            const std::uint32_t static_boundary =
                 staged.prompt.identity.shared_prefix_frontier &&
                         *staged.prompt.identity.shared_prefix_frontier > staged.base
                     ? *staged.prompt.identity.shared_prefix_frontier
                     : 0U;
+            const std::uint32_t dynamic_boundary =
+                staged.shared_capture_boundary && *staged.shared_capture_boundary > staged.base
+                    ? *staged.shared_capture_boundary
+                    : 0U;
+            const std::uint32_t shared_boundary = std::max(static_boundary, dynamic_boundary);
+            const qwen3_6::detail::RamCaptureKind boundary_kind =
+                dynamic_boundary != 0 && dynamic_boundary >= static_boundary
+                    ? qwen3_6::detail::RamCaptureKind::DynamicBoundary
+                    : qwen3_6::detail::RamCaptureKind::SharedBoundary;
             if (shared_boundary > staged.cursor && shared_boundary - staged.cursor < nominal) {
                 nominal = shared_boundary - staged.cursor;
             }
@@ -2145,7 +2163,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 copy_tail(sequence, prefill_hidden.slice(
                                         1, static_cast<std::int32_t>(result.processed_tokens) - 1,
                                         1));
-                capture_shared_prefix_boundary(sequence, staged.prompt, shared_boundary);
+                capture_shared_prefix_boundary(sequence, staged.prompt, shared_boundary,
+                                               boundary_kind);
             }
 
             if (!result.finalized) {
