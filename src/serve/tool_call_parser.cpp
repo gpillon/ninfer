@@ -236,14 +236,23 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
 std::string ToolCallStreamFilter::finish(bool is_tool_call_response) {
     if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
     finished_ = true;
+
+    // Once a complete <tool_call> marker has been recognized, everything buffered in
+    // tool_region_ belongs to the tool-call protocol region and must never be replayed
+    // as visible content, even when the final parser rejects the call as malformed or
+    // unclosed: parse_qwen_tool_call_output() drops that raw XML silently in that case,
+    // and streamed content must stay a byte-for-byte prefix of the final text.
+    tool_region_.clear();
+
     if (is_tool_call_response) {
         pending_.clear();
-        tool_region_.clear();
         return {};
     }
+
+    // pending_ only ever holds an unconfirmed partial marker or ordinary visible text
+    // (a full marker moves bytes into tool_region_ instead), so it is always safe to
+    // replay when the final response is not a tool call.
     std::string tail = std::move(pending_);
-    tail += tool_region_;
-    tool_region_.clear();
     emitted_bytes_ += tail.size();
     return tail;
 }

@@ -133,6 +133,9 @@ int test_incremental_filter_valid_tool() {
 }
 
 int test_incremental_filter_fallback() {
+    // Once a full <tool_call> marker is recognized, the buffered region belongs to the
+    // tool-call protocol and must never be replayed verbatim, even if the call turns out
+    // malformed/unclosed: only the prefix seen before the marker stays visible.
     const std::string original = "prefix  \n<tool_call>\n<function=broken>";
     ninfer::serve::ToolCallStreamFilter malformed;
     std::string restored;
@@ -146,9 +149,55 @@ int test_incremental_filter_fallback() {
     ordinary += normal.finish(false);
 
     int failures = 0;
-    failures += check(restored == original, "malformed tool filter fallback lost raw bytes");
+    failures += check(restored == "prefix", "malformed tool call XML leaked after full marker");
     failures +=
         check(ordinary == "ordinary text  ", "ordinary filtered output lost trailing whitespace");
+    return failures;
+}
+
+int test_incremental_filter_partial_marker_stays_visible() {
+    // A trailing fragment that never completes the "<tool_call>" marker is ordinary text,
+    // not a protocol region, and must be replayed verbatim on finish(false).
+    ninfer::serve::ToolCallStreamFilter filter;
+    std::string visible;
+    visible += filter.feed("Hello <tool_");
+    visible += filter.finish(false);
+
+    int failures = 0;
+    failures += check(visible == "Hello <tool_",
+                      "incomplete <tool_call> marker suffix was lost or altered");
+    failures +=
+        check(filter.emitted_bytes() == visible.size(), "partial marker byte count mismatch");
+    return failures;
+}
+
+int test_incremental_filter_matches_parser_on_malformed_marker() {
+    // Regression for the streamed_content_bytes > outcome.text.size() invariant crash:
+    // the marker is split across feed() calls, the block is unclosed/malformed, and no
+    // call is salvaged. The filter's visible output must equal the final parser's content
+    // byte-for-byte, not just be a subset, so streamed_content_bytes can never outgrow
+    // outcome.text.size().
+    const std::string raw = "Hello world <tool_call>\n<function=broken>";
+
+    ninfer::serve::ToolCallStreamFilter filter;
+    std::string streamed_visible;
+    streamed_visible += filter.feed(raw.substr(0, 15));
+    streamed_visible += filter.feed(raw.substr(15));
+
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(raw, 64);
+    streamed_visible += filter.finish(parsed.is_tool_call_response);
+
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response, "malformed/unclosed block salvaged unexpectedly");
+    failures += check(streamed_visible.find("<tool_call>") == std::string::npos,
+                      "malformed tool-call XML emitted as visible content");
+    failures += check(filter.emitted_bytes() == streamed_visible.size(),
+                      "emitted_bytes() does not match actual visible bytes");
+    failures += check(streamed_visible == parsed.content,
+                      "streamed visible text diverged from final parsed.content");
+    failures += check(filter.emitted_bytes() <= parsed.content.size(),
+                      "streamed_content_bytes would exceed outcome.text.size()");
     return failures;
 }
 
@@ -253,6 +302,8 @@ int main() {
     failures += test_configured_name_limit();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
+    failures += test_incremental_filter_partial_marker_stays_visible();
+    failures += test_incremental_filter_matches_parser_on_malformed_marker();
     failures += test_malformed_block_dropped_good_neighbors_survive();
     failures += test_malformed_param_block_dropped();
     failures += test_trailing_prose_keeps_calls();
