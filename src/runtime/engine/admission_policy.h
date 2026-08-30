@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace ninfer::runtime {
@@ -40,6 +41,23 @@ struct AdmissionProtection {
     std::uint64_t temporal_credit = 0;
     ProtectionPhase phase         = ProtectionPhase::Open;
 };
+
+// Scheduler-owned value policy for an idle lane's retained state. A reservation is temporal:
+// it exists only while an earlier queued Main request has exact reusable state on that lane.
+// Reserved lanes are not victims for later requests; all other retained state remains reclaimable.
+struct RetainedLaneCandidate {
+    std::uint32_t lane             = 0;
+    RequestClass owner             = RequestClass::Agents;
+    std::uint64_t use_tick         = 0;
+    bool reserved_for_earlier_main = false;
+};
+
+// Lowest-value eligible retained state: Classifier, then Agents, then Main; LRU within a class.
+[[nodiscard]] bool retained_lane_is_better_victim(const RetainedLaneCandidate& candidate,
+                                                  const RetainedLaneCandidate& incumbent) noexcept;
+
+[[nodiscard]] std::optional<std::uint32_t>
+choose_retained_lane_victim(std::span<const RetainedLaneCandidate> candidates) noexcept;
 
 [[nodiscard]] bool admission_resources_fit(const AdmissionResources& used,
                                            const AdmissionResources& capacity) noexcept;

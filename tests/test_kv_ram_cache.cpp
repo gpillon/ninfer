@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -186,7 +187,7 @@ int round_trip_pool(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool,
         std::cerr << label << " host image allocation failed\n";
         return 1;
     }
-    ninfer::pack_paged_kv_allocation_to_host(source, pool, image, ctx.stream);
+    ninfer::pack_paged_kv_allocation_to_host(source, pool, captured, image, ctx.stream);
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
     int failures = 0;
     if (pool.plane_order() == ninfer::PagedKVPlaneOrder::PageMajor) {
@@ -225,7 +226,10 @@ ninfer::targets::qwen3_6::PreparedPromptData text_prompt(std::vector<ninfer::Tok
 int capture_text_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
                        ninfer::PagedKVPool& pool, ninfer::PagedKVAllocation& alloc,
                        const ninfer::targets::qwen3_6::PreparedPromptData& prompt,
-                       cudaStream_t stream, std::uint32_t checkpoint_frontier = 0) {
+                       cudaStream_t stream, std::uint32_t checkpoint_frontier = 0,
+                       std::uint32_t capture_pages = std::numeric_limits<std::uint32_t>::max(),
+                       bool multi_claim = false,
+                       ninfer::RequestClass owner_class = ninfer::RequestClass::Agents) {
     ninfer::targets::qwen3_6::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
@@ -258,9 +262,17 @@ int capture_text_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
     }
     source.text      = &alloc;
     source.text_pool = &pool;
+    source.text_pages = capture_pages == std::numeric_limits<std::uint32_t>::max()
+                            ? alloc.mapped_page_count()
+                            : capture_pages;
     source.stream    = stream;
+    source.multi_claim = multi_claim;
+    source.owner_class = owner_class;
     return cache.capture(source) ? 0 : 1;
 }
+
+int expect_logical_page(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocation& allocation,
+                        std::size_t logical_index, unsigned char seed, const char* label);
 
 // The hyperquant exact-key side store is indexed by slot row, not by sequence, so a record that
 // travels between rows has to carry its own row's image; restoring into a row that still holds a
@@ -609,6 +621,131 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     }
 
     alloc.release();
+    return failures;
+}
+
+int test_capture_extent_and_eviction_policy(ninfer::DeviceContext& ctx,
+                                            ninfer::PagedKVPool& pool) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    int failures  = 0;
+    auto source   = pool.reserve(2);
+    source.materialize_pages(2, ctx.stream);
+    fill_logical_pages(pool, source, 73);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+
+    const auto prompt_a = text_prompt({101, 102, 103, 104});
+    const auto prompt_b = text_prompt({201, 202, 203, 204});
+    const auto prompt_c = text_prompt({301, 302, 303, 304});
+    const auto chain_a  = q36::detail::prefix_hash_chain(prompt_a);
+    const auto chain_b  = q36::detail::prefix_hash_chain(prompt_b);
+    const auto chain_c  = q36::detail::prefix_hash_chain(prompt_c);
+
+    q36::detail::KVRamCache full_probe(8ULL << 20);
+    q36::detail::KVRamCache prefix_probe(8ULL << 20);
+    if (capture_text_entry(full_probe, pool, source, prompt_a, ctx.stream) != 0 ||
+        capture_text_entry(prefix_probe, pool, source, prompt_a, ctx.stream, 0, 1) != 0) {
+        return fail("explicit-page capture probe failed");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    const std::size_t full_bytes   = full_probe.snapshot().used_bytes;
+    const std::size_t prefix_bytes = prefix_probe.snapshot().used_bytes;
+    if (prefix_bytes >= full_bytes ||
+        full_bytes - prefix_bytes < paged_kv_host_image_bytes(pool, 1)) {
+        std::cerr << "explicit-page capture did not reduce the RAM image: full=" << full_bytes
+                  << " prefix=" << prefix_bytes << '\n';
+        ++failures;
+    }
+
+    const auto prefix_match = prefix_probe.plan_match(prompt_a, chain_a);
+    auto destination        = pool.reserve(2);
+    destination.materialize_pages(2, ctx.stream);
+    fill_logical_pages(pool, destination, 19);
+    if (!prefix_match) {
+        ++failures;
+        std::cerr << "explicit-page capture did not index\n";
+    } else {
+        q36::detail::RamRestoreTarget target;
+        target.text           = &destination;
+        target.text_pool      = &pool;
+        target.text_dst_pages = 1;
+        target.stream         = ctx.stream;
+        prefix_probe.claim(prefix_match->entry_id);
+        (void)prefix_probe.unpack_device(prefix_match->entry_id, target);
+        prefix_probe.consume(prefix_match->entry_id);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        failures += expect_logical_page(pool, destination, 0, 73,
+                                        "explicit-page restore captured page");
+        failures += expect_logical_page(pool, destination, 1, 19,
+                                        "explicit-page restore untouched tail");
+    }
+    destination.release();
+
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    return failures;
+}
+
+int test_persistent_promotion_and_class_eviction(ninfer::DeviceContext& ctx,
+                                                 ninfer::PagedKVPool& pool) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    int failures  = 0;
+    auto source   = pool.reserve(1);
+    source.materialize_pages(1, ctx.stream);
+    fill_logical_pages(pool, source, 83);
+    const auto prompt_a = text_prompt({401, 402, 403, 404});
+    const auto prompt_b = text_prompt({501, 502, 503, 504});
+    const auto prompt_c = text_prompt({601, 602, 603, 604});
+    const auto chain_a  = q36::detail::prefix_hash_chain(prompt_a);
+    const auto chain_b  = q36::detail::prefix_hash_chain(prompt_b);
+    const auto chain_c  = q36::detail::prefix_hash_chain(prompt_c);
+    q36::detail::KVRamCache size_probe(8ULL << 20);
+    if (capture_text_entry(size_probe, pool, source, prompt_a, ctx.stream) != 0) {
+        return fail("eviction policy size probe failed");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    const std::size_t prefix_bytes = size_probe.snapshot().used_bytes;
+
+    // A successful persistent consume promotes the live record immediately. Under pressure the
+    // newer but still-probationary ordinary record must therefore leave first.
+    q36::detail::KVRamCache promoted(prefix_bytes * 2 + 256);
+    if (capture_text_entry(promoted, pool, source, prompt_a, ctx.stream, 0, 1, true) != 0 ||
+        capture_text_entry(promoted, pool, source, prompt_b, ctx.stream, 0, 1) != 0) {
+        ++failures;
+        std::cerr << "promotion policy setup capture failed\n";
+    } else {
+        const auto hit = promoted.plan_match(prompt_a, chain_a);
+        if (!hit) {
+            ++failures;
+            std::cerr << "persistent promotion source did not match\n";
+        } else {
+            promoted.claim(hit->entry_id);
+            promoted.consume(hit->entry_id);
+            (void)capture_text_entry(promoted, pool, source, prompt_c, ctx.stream, 0, 1);
+            if (!promoted.plan_match(prompt_a, chain_a) ||
+                promoted.plan_match(prompt_b, chain_b) ||
+                !promoted.plan_match(prompt_c, chain_c)) {
+                ++failures;
+                std::cerr << "persistent consume did not protect the live record\n";
+            }
+        }
+    }
+
+    // Main class survives ordinary pressure even when it is the oldest record. Classifier is the
+    // first victim; if no lower class is available, the final pass can still evict main.
+    q36::detail::KVRamCache classes(prefix_bytes * 2 + 256);
+    if (capture_text_entry(classes, pool, source, prompt_a, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Main) != 0 ||
+        capture_text_entry(classes, pool, source, prompt_b, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Classifier) != 0 ||
+        capture_text_entry(classes, pool, source, prompt_c, ctx.stream, 0, 1) != 0) {
+        ++failures;
+        std::cerr << "class eviction setup capture failed\n";
+    } else if (!classes.plan_match(prompt_a, chain_a) || classes.plan_match(prompt_b, chain_b) ||
+               !classes.plan_match(prompt_c, chain_c)) {
+        ++failures;
+        std::cerr << "class-aware eviction did not preserve main over classifier\n";
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
     return failures;
 }
 
@@ -1104,7 +1241,7 @@ int test_irregular_page_major_runs(ninfer::DeviceContext& ctx) {
     const std::size_t image_bytes = ninfer::paged_kv_host_image_bytes(pool, 5);
     ninfer::HostPinnedArena host(std::max<std::size_t>(image_bytes, 256));
     void* image = host.try_alloc(image_bytes, 256);
-    ninfer::pack_paged_kv_allocation_to_host(source, pool, image, ctx.stream);
+    ninfer::pack_paged_kv_allocation_to_host(source, pool, 5, image, ctx.stream);
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
     source.release();
     auto dest = pool.reserve(5);
@@ -1157,6 +1294,7 @@ int test_restore_throw_then_replay(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     cap.hash_c                    = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
     cap.text                      = &source;
     cap.text_pool                 = &pool;
+    cap.text_pages                = source.mapped_page_count();
     cap.tail_hidden               = &hidden;
     cap.rewrite_checkpoint_hidden = &rewrite;
     cap.stream                    = ctx.stream;
@@ -1426,8 +1564,10 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     source.hash_c             = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
     source.text               = &text;
     source.text_pool          = &text_pool;
+    source.text_pages         = text.mapped_page_count();
     source.backend            = &backend;
     source.backend_pool       = &backend_pool;
+    source.backend_pages      = backend.mapped_page_count();
     source.gdn                = &gdn;
     source.gdn_current_slot   = 0;
     source.gdn_checkpoint_slot = 1;
@@ -1594,7 +1734,7 @@ int main() {
             ninfer::paged_kv_host_image_bytes(paged_pool, consecutive_physical.mapped_page_count());
         ninfer::HostPinnedArena host(std::max<std::size_t>(image_bytes, 256));
         void* image = host.try_alloc(image_bytes, 256);
-        ninfer::pack_paged_kv_allocation_to_host(consecutive_physical, paged_pool, image,
+        ninfer::pack_paged_kv_allocation_to_host(consecutive_physical, paged_pool, 4, image,
                                                  ctx.stream);
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
         consecutive_physical.release();
@@ -1615,7 +1755,7 @@ int main() {
         const std::size_t image_bytes = ninfer::paged_kv_host_image_bytes(paged_pool, captured);
         ninfer::HostPinnedArena host(std::max<std::size_t>(image_bytes, 256));
         void* image = host.try_alloc(image_bytes, 256);
-        ninfer::pack_paged_kv_allocation_to_host(partial, paged_pool, image, ctx.stream);
+        ninfer::pack_paged_kv_allocation_to_host(partial, paged_pool, captured, image, ctx.stream);
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
         partial.release();
         auto restored = paged_pool.reserve(3);
@@ -1716,6 +1856,8 @@ int main() {
     }
 
     failures += test_kv_ram_index(ctx, paged_pool);
+    failures += test_capture_extent_and_eviction_policy(ctx, paged_pool);
+    failures += test_persistent_promotion_and_class_eviction(ctx, paged_pool);
     failures += test_unpack_consume_and_drop(ctx, paged_pool);
     failures += test_frontier_beats_checkpoint(ctx, paged_pool);
     failures += test_asymmetric_fifo(ctx, paged_pool);

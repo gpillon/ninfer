@@ -226,7 +226,7 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
                                                     std::uint32_t page_count);
 
 void pack_paged_kv_allocation_to_host(const PagedKVAllocation& allocation, const PagedKVPool& pool,
-                                      void* dst, cudaStream_t stream);
+                                      std::uint32_t page_count, void* dst, cudaStream_t stream);
 
 void unpack_paged_kv_allocation_from_host(PagedKVAllocation& allocation, const PagedKVPool& pool,
                                           const void* src, std::uint32_t src_page_count,

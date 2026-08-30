@@ -118,7 +118,7 @@ int main() {
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
-    failures += check(kRequestLogSchemaVersion == 11, "request-log schema is not version 11");
+    failures += check(kRequestLogSchemaVersion == 14, "request-log schema is not version 14");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
@@ -422,6 +422,20 @@ int main() {
                           human_throughput.find("ram_captures=") == std::string::npos &&
                           human_throughput.find("kv-ram=") == std::string::npos,
                       "human throughput report mismatch");
+    ThroughputReport sibling_throughput = throughput;
+    sibling_throughput.scheduler.sibling_prefix_samples          = 2;
+    sibling_throughput.scheduler.sibling_prefix_common_tokens_sum = 3000;
+    sibling_throughput.scheduler.sibling_prefix_common_tokens_max = 2000;
+    auto& classifier_pair = sibling_throughput.scheduler.sibling_prefix_by_class[
+        static_cast<std::size_t>(ninfer::RequestClass::Agents) * ninfer::kRequestClassCount +
+        static_cast<std::size_t>(ninfer::RequestClass::Classifier)];
+    classifier_pair.samples                = 2;
+    classifier_pair.common_tokens_sum      = 3000;
+    classifier_pair.common_tokens_max      = 2000;
+    classifier_pair.selected_reuse_gap_sum = 1000;
+    failures += check(format_throughput(sibling_throughput).find(
+                          "pairs=[agents>classifier:2/avg=1500/gap=500]") != std::string::npos,
+                      "class-separated sibling reuse telemetry missing from throughput log");
     failures += check(format_kv_ram_size(1024ULL * 1024ULL, false) == "1 MiB" &&
                           format_kv_ram_size(1024ULL * 1024ULL, true) == "1048576 B" &&
                           format_kv_ram_size(1536ULL * 1024ULL, false) == "1.5 MiB",

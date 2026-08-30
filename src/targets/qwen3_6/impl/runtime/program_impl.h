@@ -682,9 +682,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;
+        // Shared-boundary capture can occur inside the first advance_prefill call, so publish
+        // the class before entering prefill rather than after that capture opportunity.
+        sequence.owner_class                   = request_plan.owner_class;
         const runtime::PrefillStepResult first = advance_prefill(sequence, request);
         sequence.use_tick                      = next_use_tick_++;
-        sequence.owner_class                   = request_plan.owner_class;
         return first;
     } catch (...) {
         try {
@@ -1010,10 +1012,14 @@ ProgramImplCore::ram_capture_source_unchecked(const SequenceState& sequence) {
     }
     source.text       = &sequence.kv->text;
     source.text_pool  = &decoder->text_kv.pool();
+    // Preserve the complete settled allocation for terminal records. The bounded captures below
+    // are the paths where prompt materialization is known to extend beyond the reusable prefix.
+    source.text_pages = sequence.kv->text.mapped_page_count();
     source.text_cache = &decoder->text_kv;
     if (sequence.kv->backend) {
         source.backend       = &*sequence.kv->backend;
         source.backend_pool  = &backend_kv_cache()->pool();
+        source.backend_pages = sequence.kv->backend->mapped_page_count();
         source.backend_cache = backend_kv_cache();
     }
     // The exact-key side store is indexed by slot row. A retained lane is unbound, so the row is
@@ -1036,6 +1042,7 @@ ProgramImplCore::ram_capture_source_unchecked(const SequenceState& sequence) {
         source.dflash_lane = static_cast<std::int32_t>(sequence.lane);
     }
     source.stream = device.stream;
+    source.owner_class = sequence.owner_class;
     return source;
 }
 
@@ -1096,10 +1103,13 @@ void ProgramImplCore::capture_shared_prefix_boundary(SequenceState& sequence,
     source.hash_f = qwen3_6::detail::prefix_hash_at(ledger, identity, frontier);
     source.text       = &sequence.kv->text;
     source.text_pool  = &decoder->text_kv.pool();
+    source.text_pages = ninfer::pages_for_tokens(frontier);
     source.text_cache = &decoder->text_kv;
     if (sequence.kv->backend) {
         source.backend       = &*sequence.kv->backend;
         source.backend_pool  = &backend_kv_cache()->pool();
+        source.backend_pages = ninfer::pages_for_tokens(
+            speculative_backend == SpeculativeBackend::Mtp ? frontier - 1 : frontier);
         source.backend_cache = backend_kv_cache();
     }
     // Same row convention as ram_capture_source: bind_sequence_kv binds a lane to its own index.
@@ -1117,6 +1127,7 @@ void ProgramImplCore::capture_shared_prefix_boundary(SequenceState& sequence,
     }
     source.stream      = device.stream;
     source.multi_claim = true;
+    source.owner_class = sequence.owner_class;
     (void)kv_ram_cache_->capture(source);
 }
 
@@ -1127,8 +1138,55 @@ bool ProgramImplCore::capture_active_lane_for_siblings(std::uint32_t lane) {
     // lane as busy, not reclaimable -- only the prompt-region KV/GDN/tail-hidden state this reads
     // is snapshotted; nothing about the live lane is touched or torn down.
     if (active_lane_sibling_base(lane) == 0) { return false; }
-    qwen3_6::detail::RamCaptureSource source = ram_capture_source_unchecked(sequences[lane]);
-    source.multi_claim                       = true;
+    const SequenceState& sequence = sequences[lane];
+    const std::uint32_t frontier  = sequence.rewrite_checkpoint.frontier;
+
+    // This record is the checkpoint itself, not a current-decode record that merely advertises
+    // an older fallback. Keeping the generated tail would serialize unusable pages and state.
+    std::vector<TokenId> ledger(sequence.ledger.begin(),
+                                sequence.ledger.begin() +
+                                    static_cast<std::ptrdiff_t>(frontier) + 1);
+    qwen3_6::detail::ResidentPrefixIdentity identity = sequence.prefix_identity;
+    identity.truncate(ledger.size());
+
+    qwen3_6::detail::RamCaptureSource source;
+    source.execution_frontier      = frontier;
+    source.ledger_frontier         = frontier + 1;
+    source.rope_delta              = sequence.rope_delta;
+    source.text_kv_valid           = frontier;
+    source.mtp_kv_valid            = speculative_backend == SpeculativeBackend::Mtp
+                                         ? frontier - 1
+                                         : 0;
+    source.dflash_context_frontier = speculative_backend == SpeculativeBackend::DFlash
+                                         ? frontier
+                                         : 0;
+    source.tail_hidden_valid       = true;
+    source.ledger                  = ledger;
+    source.identity                = &identity;
+    source.hash_f = qwen3_6::detail::prefix_hash_at(ledger, identity, frontier);
+    source.text       = &sequence.kv->text;
+    source.text_pool  = &decoder->text_kv.pool();
+    source.text_pages = ninfer::pages_for_tokens(frontier);
+    source.text_cache = &decoder->text_kv;
+    if (sequence.kv->backend) {
+        source.backend       = &*sequence.kv->backend;
+        source.backend_pool  = &backend_kv_cache()->pool();
+        source.backend_pages = ninfer::pages_for_tokens(
+            speculative_backend == SpeculativeBackend::Mtp ? frontier - 1 : frontier);
+        source.backend_cache = backend_kv_cache();
+    }
+    source.residual_row       = static_cast<std::int32_t>(sequence.lane);
+    source.gdn                = &decoder->linear_attention;
+    source.gdn_current_slot   = LinearStateSlots::rewrite_checkpoint_state_slot(
+        sequence.lane, max_concurrency);
+    source.tail_hidden        = &sequence.rewrite_checkpoint_hidden;
+    if (dflash) {
+        source.dflash_local = &dflash->rewrite_checkpoint_local;
+        source.dflash_lane  = static_cast<std::int32_t>(sequence.lane);
+    }
+    source.stream      = device.stream;
+    source.multi_claim = true;
+    source.owner_class = sequence.owner_class;
     return kv_ram_cache_->capture(source);
 }
 
@@ -1146,6 +1204,14 @@ std::uint32_t ProgramImplCore::active_lane_sibling_base(std::uint32_t lane) cons
         sequence.ledger_frontier != sequence.execution_frontier + 1 ||
         sequence.ledger.size() != sequence.ledger_frontier ||
         sequence.prefix_identity.size() != sequence.ledger_frontier) {
+        return 0;
+    }
+    // The hyperquant recent side store is a cyclic row outside the paged allocation. Once decode
+    // has advanced beyond the checkpoint even one slot may contain a generated key instead of
+    // the checkpoint's oldest exact recent key, so a checkpoint-only image is no longer exact.
+    if (sequence.execution_frontier != sequence.rewrite_checkpoint.frontier &&
+        (decoder->text_kv.residual_enabled() ||
+         (backend_kv_cache() != nullptr && backend_kv_cache()->residual_enabled()))) {
         return 0;
     }
     return sequence.rewrite_checkpoint.frontier;

@@ -905,6 +905,29 @@ floor 0.93, ~0.008 margin) in the check message so a trip is interpretable.
   at 100-500k tokens on LongBench v2; single greedy synthetic probes are not the quality
   instrument, the suites are.
 
+## Session addendum (2026-08-30): coding-agent cache durability
+
+The coding-agent cache changes are implemented and independently reviewed. Shared-boundary and
+active-sibling RAM captures now serialize only the reusable page extent; active snapshots are
+self-consistent rewrite-checkpoint images. RAM records retain their request class, evict
+`Classifier -> Agents -> Main`, and promote a live multi-claim record after its first hit. The
+scheduler temporarily reserves the best positive retained match for a pending FIFO-head `Main`,
+uses the same class/LRU victim policy in all admission passes, and bounds failed sibling-capture
+retries by `(frontier, RAM index version)`. Sibling overlap telemetry is split by source/target
+request class.
+
+Fresh Windows Ninja verification: admission-policy, request-log, KV-RAM-cache, and runtime-
+mechanisms tests pass; `ninfer-serve` builds. A real Qwen3.8 HTTP MTP smoke with one lane observed
+`Main -> Classifier -> Main` restore from `host_ram` (`cache=37`, `drops=0`) followed by a
+`vram_resident` continuation (`cache=60`). The broader `ninfer_qwen3_6_27b_ram_real_test` passes
+all ordinary cases but retains a pre-existing deterministic failure at `MTP suffix RAM reuse
+changed greedy output`. Causal review found the failing concurrency-1 terminal path byte-equivalent
+to baseline and outside the new shared/sibling/class-policy paths. Follow-up discriminator: compare
+the same suffix through `VramResident`; a failure there implicates the generic MTP suffix bridge,
+otherwise inspect terminal MTP host image/unpack.
+
+Feature documentation remains intentionally deferred per the user request.
+
 ## Remaining work (in priority order)
 
 ### 0. 1M-context track (M1/M2 quality blocker CLEARED by WI-8, session 16)

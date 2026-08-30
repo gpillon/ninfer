@@ -514,22 +514,24 @@ void KVRamCache::note_lineage_hit(std::uint64_t origin_hash) {
 }
 
 void KVRamCache::evict_unpinned() {
-    // Two-pass: prefer displacing probationary (never-hit) entries first, so a burst of
-    // short one-shot captures cannot evict a checkpoint from a conversation that has already
-    // demonstrated reuse. Fall back to protected entries only when no probationary entry is
-    // available, so capture() is still guaranteed forward progress.
-    for (std::uint64_t id : fifo_) {
-        const auto it = records_.find(id);
-        if (it != records_.end() && it->second.claims == 0 && !it->second.protected_tier) {
-            destroy_record(id, true);
-            return;
-        }
-    }
-    for (std::uint64_t id : fifo_) {
-        const auto it = records_.find(id);
-        if (it != records_.end() && it->second.claims == 0) {
-            destroy_record(id, true);
-            return;
+    // Class is durable across a VRAM spill. Classifier records and unproven non-main records
+    // churn first, demonstrated ordinary agent state next, and main conversation state last.
+    // Claims remain absolute pins; the final main pass preserves capture forward progress.
+    for (int rank = 0; rank != 3; ++rank) {
+        for (std::uint64_t id : fifo_) {
+            const auto it = records_.find(id);
+            if (it == records_.end() || it->second.claims != 0) { continue; }
+            const Record& record = it->second;
+            const int record_rank = record.owner_class == runtime::RequestClass::Main
+                                        ? 2
+                                        : (record.owner_class == runtime::RequestClass::Classifier ||
+                                                   !record.protected_tier
+                                               ? 0
+                                               : 1);
+            if (record_rank == rank) {
+                destroy_record(id, true);
+                return;
+            }
         }
     }
 }
@@ -560,6 +562,7 @@ void KVRamCache::consume(std::uint64_t entry_id) {
         // Another sibling may still want to restore from this same entry -- drop this claim but
         // keep the record, which stays matchable throughout. It ages out through ordinary
         // FIFO/tiered eviction like any other record once nothing claims it further.
+        record.protected_tier = true;
         bump_version();
         return;
     }
@@ -639,6 +642,16 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
     if (source.identity == nullptr || source.text == nullptr || source.text_pool == nullptr) {
         throw std::invalid_argument("RAM capture source is incomplete");
     }
+    if (source.text_pages > source.text->mapped_page_count()) {
+        throw std::logic_error("RAM capture text extent exceeds mapped pages");
+    }
+    if ((source.backend == nullptr) != (source.backend_pool == nullptr) ||
+        (source.backend == nullptr && source.backend_pages != 0)) {
+        throw std::invalid_argument("RAM capture backend source is inconsistent");
+    }
+    if (source.backend != nullptr && source.backend_pages > source.backend->mapped_page_count()) {
+        throw std::logic_error("RAM capture backend extent exceeds mapped pages");
+    }
     if (source.ledger.size() != source.ledger_frontier ||
         source.ledger_frontier != source.execution_frontier + 1) {
         throw std::logic_error("RAM capture ledger frontier is inconsistent");
@@ -656,8 +669,8 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
     header.rewrite_kind            = source.rewrite_kind;
     header.hash_c_valid            = source.hash_c_valid;
     header.rewrite_frontier        = source.rewrite_frontier;
-    header.text_mapped_pages       = source.text->mapped_page_count();
-    header.backend_mapped_pages    = source.backend ? source.backend->mapped_page_count() : 0;
+    header.text_mapped_pages       = source.text_pages;
+    header.backend_mapped_pages    = source.backend_pages;
     header.text_plane_count        = static_cast<std::uint32_t>(source.text_pool->plane_count());
     header.backend_plane_count     =
         source.backend_pool ? static_cast<std::uint32_t>(source.backend_pool->plane_count()) : 0;
@@ -793,14 +806,16 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         };
         if (lengths[2] != 0) {
             start_device_copies();
-            pack_paged_kv_allocation_to_host(*source.text, *source.text_pool, raw + header.offset[2],
+            pack_paged_kv_allocation_to_host(*source.text, *source.text_pool,
+                                             header.text_mapped_pages, raw + header.offset[2],
                                              source.stream);
             copies_launched = true;
         }
         if (source.backend != nullptr && lengths[3] != 0) {
             start_device_copies();
             pack_paged_kv_allocation_to_host(*source.backend, *source.backend_pool,
-                                             raw + header.offset[3], source.stream);
+                                             header.backend_mapped_pages, raw + header.offset[3],
+                                             source.stream);
             copies_launched = true;
         }
         if (source.gdn != nullptr) {
@@ -870,6 +885,7 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         record.origin_hash         = hash_origin(source.ledger);
         record.protected_tier      = lineage_is_hot(record.origin_hash);
         record.multi_claim         = source.multi_claim;
+        record.owner_class         = source.owner_class;
         record.copies_start        = copies_start;
         copies_start               = nullptr;
         const auto [it, inserted]  = records_.emplace(record.id, record);

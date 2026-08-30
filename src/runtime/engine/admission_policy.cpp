@@ -40,6 +40,18 @@ bool contains(std::span<const std::uint64_t> ids, std::uint64_t id) noexcept {
     return std::find(ids.begin(), ids.end(), id) != ids.end();
 }
 
+std::uint8_t retained_victim_priority(RequestClass owner) noexcept {
+    switch (owner) {
+    case RequestClass::Classifier:
+        return 0;
+    case RequestClass::Agents:
+        return 1;
+    case RequestClass::Main:
+        return 2;
+    }
+    return 1;
+}
+
 bool is_incumbent(const AdmissionProtection& protection, std::uint64_t id) noexcept {
     return contains(
         std::span<const std::uint64_t>(protection.incumbent_ids.data(), protection.incumbent_count),
@@ -52,6 +64,35 @@ bool is_donor(const AdmissionProtection& protection, std::uint64_t id) noexcept 
 }
 
 } // namespace
+
+bool retained_lane_is_better_victim(const RetainedLaneCandidate& candidate,
+                                    const RetainedLaneCandidate& incumbent) noexcept {
+    if (candidate.reserved_for_earlier_main != incumbent.reserved_for_earlier_main) {
+        return !candidate.reserved_for_earlier_main;
+    }
+    if (candidate.reserved_for_earlier_main) { return false; }
+    const std::uint8_t candidate_priority = retained_victim_priority(candidate.owner);
+    const std::uint8_t incumbent_priority = retained_victim_priority(incumbent.owner);
+    if (candidate_priority != incumbent_priority) {
+        return candidate_priority < incumbent_priority;
+    }
+    if (candidate.use_tick != incumbent.use_tick) {
+        return candidate.use_tick < incumbent.use_tick;
+    }
+    return candidate.lane < incumbent.lane;
+}
+
+std::optional<std::uint32_t>
+choose_retained_lane_victim(std::span<const RetainedLaneCandidate> candidates) noexcept {
+    const RetainedLaneCandidate* selected = nullptr;
+    for (const RetainedLaneCandidate& candidate : candidates) {
+        if (candidate.reserved_for_earlier_main) { continue; }
+        if (selected == nullptr || retained_lane_is_better_victim(candidate, *selected)) {
+            selected = &candidate;
+        }
+    }
+    return selected != nullptr ? std::optional<std::uint32_t>(selected->lane) : std::nullopt;
+}
 
 bool admission_resources_fit(const AdmissionResources& used,
                              const AdmissionResources& capacity) noexcept {

@@ -308,12 +308,11 @@ private:
         std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions{};
         std::optional<Plan> ram_plan;
         std::uint64_t ram_index_version = 0;
-        // Per lane, the sibling-snapshot base this request has already tried to capture. An
-        // attempt that did not end in reuse (the capture failed, or the resulting record was
-        // rejected by the exact-match verification) must not be retried against the same
-        // snapshot point: find_admission_lane runs about once per decode round, so an
-        // unconditional retry would re-capture, re-hash and re-plan on every one of them.
+        // Per lane, the last sibling-snapshot base attempted for this request and the RAM index
+        // version observed after that attempt. Capacity pressure is retryable only after another
+        // cache-state change; invariant/CUDA failures propagate.
         std::array<std::uint32_t, kMaximumConcurrency> sibling_capture_bases{};
+        std::array<std::uint64_t, kMaximumConcurrency> sibling_capture_versions{};
         AdmissionResources admission_resources;
         std::uint64_t remaining_service_work = 0;
         std::uint64_t backfill_epoch         = 0;
@@ -363,9 +362,9 @@ private:
     };
 
     struct LaneChoice {
-        std::uint32_t lane      = 0;
-        bool evict_retained     = false;
-        std::uint64_t ram_entry_id = 0;
+        std::uint32_t lane          = 0;
+        bool evict_retained         = false;
+        std::uint64_t ram_entry_id  = 0;
     };
 
     void append_output(const std::shared_ptr<Request>& request,
@@ -759,18 +758,56 @@ private:
         request->ram_index_version = version;
     }
 
-    // A retained lane owned by @main holds the long-lived agent conversation, and recycling or
-    // evicting it charges that conversation a full re-prefill on its next turn -- 98k tokens /
-    // 24.2s in the production trace that motivated this, spent so that a 487-token helper could
-    // land on the fattest lane (the fattest is exactly the one can_admit_lane finds feasible
-    // under page pressure, since it is the one whose release frees the most). So rank such a
-    // lane LAST among the candidates a request could take, never exclude it: every lane that is
-    // admissible today stays admissible, this only reorders the choice among them. Untagged
-    // traffic is entirely RequestClass::Agents, which makes the predicate constantly false.
+    // A retained Main lane is a last-resort victim in ordinary traffic. While the protected FIFO
+    // head is itself Main, its best exact retained match is temporarily reserved from backfill;
+    // the reservation disappears with that head/protection epoch, so it cannot become a permanent
+    // pin or alter the no-preemption admission contract.
     [[nodiscard]] bool defers_to_main_lane(std::uint32_t lane,
                                            RequestClass incoming) const noexcept {
         return incoming != RequestClass::Main && instance_.program->has_retained_lane(lane) &&
                instance_.program->retained_owner_class(lane) == RequestClass::Main;
+    }
+
+    [[nodiscard]] std::array<bool, kMaximumConcurrency>
+    protected_main_lane_reservations(const std::shared_ptr<Request>& incoming) {
+        std::array<bool, kMaximumConcurrency> reserved{};
+        if (incoming->options.execution.request_class == RequestClass::Main || !protection_) {
+            return reserved;
+        }
+        const std::vector<std::shared_ptr<Request>> queued = pending_snapshot();
+        if (queued.empty() || queued.front()->id != protection_->head_request_id ||
+            queued.front()->options.execution.request_class != RequestClass::Main) {
+            return reserved;
+        }
+
+        const std::shared_ptr<Request>& main = queued.front();
+        std::optional<std::uint32_t> best_lane;
+        std::uint32_t best_reuse = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr || !instance_.program->has_retained_lane(lane) ||
+                instance_.program->retained_owner_class(lane) != RequestClass::Main) {
+                continue;
+            }
+            ensure_lane_plan(main, lane);
+            const std::uint32_t reuse = main->lane_plans[lane]->summary().reusable_prompt_tokens;
+            if (reuse > best_reuse) {
+                best_lane  = lane;
+                best_reuse = reuse;
+            }
+        }
+        if (best_lane) { reserved[*best_lane] = true; }
+        return reserved;
+    }
+
+    [[nodiscard]] RetainedLaneCandidate retained_lane_candidate(
+        std::uint32_t lane,
+        const std::array<bool, kMaximumConcurrency>& reservations) const noexcept {
+        return RetainedLaneCandidate{
+            .lane                      = lane,
+            .owner                     = instance_.program->retained_owner_class(lane),
+            .use_tick                  = instance_.program->retained_use_tick(lane),
+            .reserved_for_earlier_main = reservations[lane],
+        };
     }
 
     [[nodiscard]] std::optional<LaneChoice>
@@ -791,11 +828,11 @@ private:
             ram_plan != nullptr ? ram_plan->summary().ram_entry_id : 0ULL;
 
         const RequestClass incoming_class = request->options.execution.request_class;
+        const auto main_reservations       = protected_main_lane_reservations(request);
 
         auto first_ram_lane = [&](bool after_eviction) -> std::optional<std::uint32_t> {
-            std::optional<std::uint32_t> dirty;
-            std::uint64_t dirty_tick = 0;
-            bool dirty_defers        = false;
+            std::array<RetainedLaneCandidate, kMaximumConcurrency> dirty{};
+            std::size_t dirty_count = 0;
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                 if (slots_[lane] != nullptr) { continue; }
                 const bool feasible =
@@ -804,18 +841,10 @@ private:
                         : instance_.program->can_admit_lane(lane, *ram_plan);
                 if (!feasible) { continue; }
                 if (!instance_.program->has_retained_lane(lane)) { return lane; }
-                const std::uint64_t tick = instance_.program->retained_use_tick(lane);
-                const bool defers        = defers_to_main_lane(lane, incoming_class);
-                // Same fallback as before -- a retained lane is still returned when it is the
-                // only feasible one -- with @main's lane ranked behind the others.
-                if (!dirty || (dirty_defers && !defers) ||
-                    (defers == dirty_defers && tick < dirty_tick)) {
-                    dirty        = lane;
-                    dirty_tick   = tick;
-                    dirty_defers = defers;
-                }
+                dirty[dirty_count++] = retained_lane_candidate(lane, main_reservations);
             }
-            return dirty;
+            return choose_retained_lane_victim(
+                std::span<const RetainedLaneCandidate>(dirty.data(), dirty_count));
         };
 
         std::optional<LaneChoice> selected;
@@ -823,6 +852,7 @@ private:
         bool selected_dirty          = false;
         bool selected_defers         = false;
         auto consider_vram           = [&](std::uint32_t lane, std::uint32_t reuse, bool evict) {
+            if (main_reservations[lane]) { return; }
             const bool dirty  = instance_.program->has_retained_lane(lane);
             const bool defers = defers_to_main_lane(lane, incoming_class);
             // Deference outranks reuse: a lane that only reuses is cheaper to give up than a
@@ -835,10 +865,11 @@ private:
                 if (reuse == selected_reuse) {
                     if (!selected_dirty) { return; }
                     if (dirty) {
-                        const std::uint64_t selected_tick =
-                            instance_.program->retained_use_tick(selected->lane);
-                        const std::uint64_t tick = instance_.program->retained_use_tick(lane);
-                        if (tick >= selected_tick) { return; }
+                        const RetainedLaneCandidate candidate =
+                            retained_lane_candidate(lane, main_reservations);
+                        const RetainedLaneCandidate incumbent =
+                            retained_lane_candidate(selected->lane, main_reservations);
+                        if (!retained_lane_is_better_victim(candidate, incumbent)) { return; }
                     }
                 }
             }
@@ -957,32 +988,29 @@ private:
 
         try {
             if (choice.evict_retained) {
-                const RequestClass incoming_class = request->options.execution.request_class;
+                const auto main_reservations = protected_main_lane_reservations(request);
                 while (!instance_.program->can_admit_lane(lane, winning_plan)) {
-                    std::optional<std::uint32_t> victim;
-                    std::uint64_t victim_tick = 0;
-                    bool victim_defers        = false;
+                    std::array<RetainedLaneCandidate, kMaximumConcurrency> candidates{};
+                    std::size_t candidate_count = 0;
                     for (std::uint32_t retained_lane = 0; retained_lane < max_concurrency_;
                          ++retained_lane) {
                         if (retained_lane == lane || slots_[retained_lane] != nullptr ||
                             !instance_.program->has_retained_lane(retained_lane)) {
                             continue;
                         }
-                        const std::uint64_t tick =
-                            instance_.program->retained_use_tick(retained_lane);
-                        const bool defers = defers_to_main_lane(retained_lane, incoming_class);
-                        // @main's lane is the last victim standing, not an excluded one: the
-                        // candidate set is unchanged, so the "did not make admission feasible"
-                        // invariant below stays exactly as reachable as it was (i.e. never).
-                        if (!victim || (victim_defers && !defers) ||
-                            (defers == victim_defers && tick < victim_tick)) {
-                            victim        = retained_lane;
-                            victim_tick   = tick;
-                            victim_defers = defers;
-                        }
+                        candidates[candidate_count++] =
+                            retained_lane_candidate(retained_lane, main_reservations);
                     }
+                    const std::optional<std::uint32_t> victim = choose_retained_lane_victim(
+                        std::span<const RetainedLaneCandidate>(candidates.data(), candidate_count));
                     if (!victim) {
-                        throw std::logic_error("retained eviction did not make admission feasible");
+                        // can_admit_lane_after_retained_eviction is target-level and deliberately
+                        // knows nothing about scheduler reservations. If feasibility depended on
+                        // the protected Main match, leave this backfill queued and let the Main
+                        // head consume its state when the frozen resource frontier matures.
+                        release_ram_if_needed();
+                        publish_runtime_stats();
+                        return AdmissionProgress::None;
                     }
                     (void)instance_.program->capture_retained_lane(*victim);
                     instance_.program->evict_retained_lane(*victim);
@@ -1106,7 +1134,11 @@ private:
                 base > data.token_ids.size()) {
                 continue;
             }
-            if (request->sibling_capture_bases[lane] == base) { continue; }
+            const std::uint64_t capture_version = instance_.program->kv_ram_index_version();
+            if (request->sibling_capture_bases[lane] == base &&
+                request->sibling_capture_versions[lane] == capture_version) {
+                continue;
+            }
             const std::span<const TokenId> lane_tokens =
                 instance_.program->active_lane_tokens(lane);
             if (lane_tokens.size() < base ||
@@ -1114,13 +1146,12 @@ private:
                             data.token_ids.begin())) {
                 continue;
             }
-            request->sibling_capture_bases[lane] = base;
-            try {
-                if (instance_.program->capture_active_lane_for_siblings(lane)) { return true; }
-            } catch (...) {
-                // A failed opportunistic snapshot must never fail the incoming request; it just
-                // prefills normally, exactly as it would have without this feature.
-                return false;
+            const bool captured = instance_.program->capture_active_lane_for_siblings(lane);
+            request->sibling_capture_bases[lane]    = base;
+            request->sibling_capture_versions[lane] =
+                instance_.program->kv_ram_index_version();
+            if (captured) {
+                return true;
             }
         }
         return false;
@@ -1132,11 +1163,13 @@ private:
     // actual common-prefix distribution across concurrent-sibling bursts before any reuse
     // mechanism is built on top of it.
     void record_sibling_prefix_sample(const Request& admitted,
-                                      const std::vector<std::shared_ptr<Request>>& queued) {
+                                      const std::vector<std::shared_ptr<Request>>& queued,
+                                      std::uint32_t selected_reuse) {
         constexpr std::size_t kNoiseFloorTokens = 64;
         const targets::qwen3_6::PreparedPromptData& admitted_data =
             targets::qwen3_6::PreparedPromptAccess::view(admitted.prompt);
         std::size_t best = 0;
+        RequestClass best_source = RequestClass::Agents;
         for (const std::shared_ptr<Request>& other : queued) {
             if (other->id == admitted.id) { continue; }
             const targets::qwen3_6::PreparedPromptData& other_data =
@@ -1146,7 +1179,10 @@ private:
                              other_data.token_ids.begin(), other_data.token_ids.end());
             const std::size_t common =
                 static_cast<std::size_t>(mismatch_a - admitted_data.token_ids.begin());
-            best = std::max(best, common);
+            if (common > best) {
+                best        = common;
+                best_source = other->options.execution.request_class;
+            }
         }
         if (best < kNoiseFloorTokens) { return; }
         ++cumulative_stats_.sibling_prefix_samples;
@@ -1154,6 +1190,16 @@ private:
         cumulative_stats_.sibling_prefix_common_tokens_max =
             std::max(cumulative_stats_.sibling_prefix_common_tokens_max,
                      static_cast<std::uint64_t>(best));
+        const std::size_t source = static_cast<std::size_t>(best_source);
+        const std::size_t target =
+            static_cast<std::size_t>(admitted.options.execution.request_class);
+        SiblingPrefixClassStats& by_class =
+            cumulative_stats_.sibling_prefix_by_class[source * kRequestClassCount + target];
+        ++by_class.samples;
+        by_class.common_tokens_sum += best;
+        by_class.common_tokens_max =
+            std::max(by_class.common_tokens_max, static_cast<std::uint64_t>(best));
+        if (best > selected_reuse) { by_class.selected_reuse_gap_sum += best - selected_reuse; }
     }
 
     AdmissionProgress try_admit_one() {
@@ -1211,7 +1257,11 @@ private:
                 continue;
             }
             if (head_lane) {
-                record_sibling_prefix_sample(*head, queued);
+                const RequestPlanSummary& selected =
+                    head_lane->ram_entry_id != 0
+                        ? head->ram_plan->summary()
+                        : head->lane_plans[head_lane->lane]->summary();
+                record_sibling_prefix_sample(*head, queued, selected.reusable_prompt_tokens);
                 return admit_planned_request(head, *head_lane, BackfillClass::None, 0);
             }
 
@@ -1293,7 +1343,8 @@ private:
                     backfill = BackfillClass::Temporal;
                 }
                 if (backfill != BackfillClass::None) {
-                    record_sibling_prefix_sample(*candidate, queued);
+                    record_sibling_prefix_sample(*candidate, queued,
+                                                 candidate_plan.reusable_prompt_tokens);
                     return admit_planned_request(candidate, *candidate_lane, backfill,
                                                  protection_->epoch_id);
                 }

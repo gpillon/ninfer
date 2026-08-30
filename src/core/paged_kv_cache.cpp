@@ -581,14 +581,17 @@ std::size_t paged_kv_host_image_bytes(const PagedKVPool& pool, std::uint32_t pag
 }
 
 void pack_paged_kv_allocation_to_host(const PagedKVAllocation& allocation, const PagedKVPool& pool,
-                                      void* dst, cudaStream_t stream) {
+                                      std::uint32_t page_count, void* dst, cudaStream_t stream) {
     if (!allocation.valid() || !allocation.belongs_to(pool)) {
         throw std::invalid_argument("Paged KV pack requires an allocation from the named pool");
     }
-    if (dst == nullptr && allocation.mapped_page_count() != 0) {
+    if (page_count > allocation.mapped_page_count()) {
+        throw std::logic_error("Paged KV pack extent exceeds mapped source pages");
+    }
+    if (dst == nullptr && page_count != 0) {
         throw std::invalid_argument("Paged KV pack destination is null");
     }
-    const std::span<const std::int32_t> pages = allocation.page_ids();
+    const std::span<const std::int32_t> pages = allocation.page_ids().first(page_count);
     const PagedKVPlaneOrder order             = pool.plane_order();
     auto* out                                 = static_cast<unsigned char*>(dst);
     for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {

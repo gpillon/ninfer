@@ -195,6 +195,7 @@ int capture_bundle(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::
     source.hash_c = ninfer::targets::qwen3_6::detail::prefix_hash_at(retained.token_ids, identity, 4);
     source.text                 = &alloc;
     source.text_pool            = &pool;
+    source.text_pages           = alloc.mapped_page_count();
     source.gdn                  = &gdn;
     source.gdn_current_slot     = 0;
     source.gdn_checkpoint_slot  = 1;
@@ -338,7 +339,7 @@ int main() {
     for (int i = 0; i < kWarmup; ++i) {
         CUDA_CHECK(cudaMemcpyAsync(kv_host, kv_bulk.p, kv_bytes, cudaMemcpyDeviceToHost, ctx.stream));
         CUDA_CHECK(cudaMemcpyAsync(kv_bulk.p, kv_host, kv_bytes, cudaMemcpyHostToDevice, ctx.stream));
-        ninfer::pack_paged_kv_allocation_to_host(fragmented, kv_pool, kv_host, ctx.stream);
+        ninfer::pack_paged_kv_allocation_to_host(fragmented, kv_pool, kKvPages, kv_host, ctx.stream);
         ninfer::unpack_paged_kv_allocation_from_host(fragmented, kv_pool, kv_host, kKvPages, kKvPages,
                                                      ctx.stream);
     }
@@ -356,7 +357,7 @@ int main() {
 
     CUDA_CHECK(cudaEventRecord(start, ctx.stream));
     for (int i = 0; i < kIters; ++i) {
-        ninfer::pack_paged_kv_allocation_to_host(fragmented, kv_pool, kv_host, ctx.stream);
+        ninfer::pack_paged_kv_allocation_to_host(fragmented, kv_pool, kKvPages, kv_host, ctx.stream);
         ninfer::unpack_paged_kv_allocation_from_host(fragmented, kv_pool, kv_host, kKvPages, kKvPages,
                                                      ctx.stream);
     }
@@ -380,7 +381,7 @@ int main() {
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
     CUDA_CHECK(cudaEventRecord(start, ctx.stream));
     for (int i = 0; i < kIters; ++i) {
-        ninfer::pack_paged_kv_allocation_to_host(contiguous, kv_pool, kv_host, ctx.stream);
+        ninfer::pack_paged_kv_allocation_to_host(contiguous, kv_pool, kKvPages, kv_host, ctx.stream);
         ninfer::unpack_paged_kv_allocation_from_host(contiguous, kv_pool, kv_host, kKvPages, kKvPages,
                                                      ctx.stream);
     }

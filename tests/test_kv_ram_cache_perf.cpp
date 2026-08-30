@@ -113,6 +113,7 @@ int capture_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::P
         retained.token_ids, identity, source.execution_frontier);
     source.text        = &alloc;
     source.text_pool   = &pool;
+    source.text_pages  = alloc.mapped_page_count();
     source.gdn         = gdn;
     source.gdn_current_slot = gdn != nullptr ? 0 : -1;
     source.tail_hidden = hidden;
@@ -180,7 +181,7 @@ int main() {
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
     CUDA_CHECK(cudaEventRecord(start, ctx.stream));
     for (int i = 0; i < kIters; ++i) {
-        ninfer::pack_paged_kv_allocation_to_host(source, pool, pinned_block, ctx.stream);
+        ninfer::pack_paged_kv_allocation_to_host(source, pool, kPages, pinned_block, ctx.stream);
         ninfer::unpack_paged_kv_allocation_from_host(source, pool, pinned_block, kPages, kPages,
                                                      ctx.stream);
     }

@@ -43,8 +43,12 @@ struct RamCaptureSource {
 
     const PagedKVAllocation* text      = nullptr;
     const PagedKVPool* text_pool       = nullptr;
+    // Exact physical image extents. Capturing a reusable prefix must not serialize pages that
+    // were materialized speculatively for the remainder of the prompt.
+    std::uint32_t text_pages           = 0;
     const PagedKVAllocation* backend   = nullptr;
     const PagedKVPool* backend_pool    = nullptr;
+    std::uint32_t backend_pages        = 0;
 
     // The caches themselves, for the exact-key side store the pools do not own, plus the slot row
     // that store is indexed by. A retained lane is unbound, so the row cannot be read back from
@@ -65,6 +69,8 @@ struct RamCaptureSource {
     std::int32_t dflash_lane               = 0;
 
     cudaStream_t stream = nullptr;
+
+    runtime::RequestClass owner_class = runtime::RequestClass::Agents;
 
     // True for a speculative snapshot of a lane that is still actively serving its own request
     // (captured right as its prefill completes, before decode -- see
@@ -212,6 +218,7 @@ private:
         // claim/restore the same entry; it then ages out through ordinary eviction like any
         // other record, no special-cased cleanup required.
         bool multi_claim               = false;
+        runtime::RequestClass owner_class = runtime::RequestClass::Agents;
     };
 
     struct Layout {

@@ -569,6 +569,24 @@ std::string format_throughput(const ThroughputReport& report) {
         out << " sibling-prefix samples=" << report.scheduler.sibling_prefix_samples
             << " avg=" << std::setprecision(0) << average
             << " max=" << report.scheduler.sibling_prefix_common_tokens_max;
+        constexpr std::array<const char*, ninfer::kRequestClassCount> class_names{
+            "agents", "main", "classifier"};
+        out << " pairs=[";
+        bool first = true;
+        for (std::size_t source = 0; source < ninfer::kRequestClassCount; ++source) {
+            for (std::size_t target = 0; target < ninfer::kRequestClassCount; ++target) {
+                const ninfer::SiblingPrefixClassStats& pair =
+                    report.scheduler.sibling_prefix_by_class[
+                        source * ninfer::kRequestClassCount + target];
+                if (pair.samples == 0) { continue; }
+                if (!first) { out << ','; }
+                first = false;
+                out << class_names[source] << '>' << class_names[target] << ':' << pair.samples
+                    << "/avg=" << pair.common_tokens_sum / pair.samples
+                    << "/gap=" << pair.selected_reuse_gap_sum / pair.samples;
+            }
+        }
+        out << ']';
     }
     return out.str();
 }

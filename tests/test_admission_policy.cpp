@@ -18,6 +18,7 @@ int main() {
     using ninfer::runtime::ActiveAdmissionSnapshot;
     using ninfer::runtime::AdmissionResources;
     using ninfer::runtime::BackfillClass;
+    using ninfer::runtime::RetainedLaneCandidate;
 
     int failures = 0;
     const AdmissionResources capacity{
@@ -162,6 +163,24 @@ int main() {
         !ninfer::runtime::persistent_backfill_is_safe(no_lane, two_large, tiny, two_lanes),
         "2-page leftover fit ignored that both lanes are occupied");
 
+    std::array<RetainedLaneCandidate, 4> retained{
+        RetainedLaneCandidate{.lane = 0, .owner = ninfer::RequestClass::Main, .use_tick = 1},
+        RetainedLaneCandidate{.lane = 1, .owner = ninfer::RequestClass::Agents, .use_tick = 2},
+        RetainedLaneCandidate{.lane = 2, .owner = ninfer::RequestClass::Classifier, .use_tick = 9},
+        RetainedLaneCandidate{.lane = 3, .owner = ninfer::RequestClass::Classifier, .use_tick = 4},
+    };
+    failures += check(ninfer::runtime::choose_retained_lane_victim(retained) == 3,
+                      "classifier retained state was not reclaimed first with LRU tie-breaking");
+    retained[3].reserved_for_earlier_main = true;
+    failures += check(ninfer::runtime::choose_retained_lane_victim(retained) == 2,
+                      "a reserved lane remained eligible as a retained victim");
+    retained[2].reserved_for_earlier_main = true;
+    failures += check(ninfer::runtime::choose_retained_lane_victim(retained) == 1,
+                      "agent state was not preferred over main after classifier reservations");
+    retained[0].reserved_for_earlier_main = true;
+    retained[1].reserved_for_earlier_main = true;
+    failures += check(!ninfer::runtime::choose_retained_lane_victim(retained).has_value(),
+                      "pending-main reservations did not pin all matching retained lanes");
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -183,6 +184,8 @@ enum class RequestClass : std::uint8_t {
     Main,
     Classifier,
 };
+
+inline constexpr std::size_t kRequestClassCount = 3;
 
 struct ExecutionOptions {
     SamplingOverrides sampling;
@@ -490,6 +493,14 @@ struct MemorySummary {
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
 // interval throughput by subtracting two snapshots and dividing by their own monotonic wall time.
+struct SiblingPrefixClassStats {
+    std::uint64_t samples                  = 0;
+    std::uint64_t common_tokens_sum        = 0;
+    std::uint64_t common_tokens_max        = 0;
+    // Positive part of common-prefix tokens minus the reuse selected at admission.
+    std::uint64_t selected_reuse_gap_sum   = 0;
+};
+
 struct RuntimeStats {
     // Actual prompt tokens evaluated by prefill; resident prefix hits are excluded.
     std::uint64_t computed_prefill_tokens = 0;
@@ -515,6 +526,10 @@ struct RuntimeStats {
     std::uint64_t sibling_prefix_samples             = 0;
     std::uint64_t sibling_prefix_common_tokens_sum    = 0;
     std::uint64_t sibling_prefix_common_tokens_max    = 0;
+    // Row-major [source class][admitted target class]. Source is the queued sibling with the
+    // longest exact leading-token match. This separates classifier bursts from agent fan-out.
+    std::array<SiblingPrefixClassStats, kRequestClassCount * kRequestClassCount>
+        sibling_prefix_by_class{};
 };
 
 struct LoadSummary {
