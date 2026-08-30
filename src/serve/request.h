@@ -164,8 +164,35 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
     return {};
 }
 
+// Split a trailing `@main` / `@agents` / `@classifier` request-class tag off a wire model id.
+// Only those three suffixes are recognised; anything else -- no `@` at all, an unknown tag, or a
+// model id that legitimately contains an `@` -- leaves the string untouched and resolves to
+// Agents, so an old or mistyped client still validates against the plain model id instead of
+// getting a 404. The split is on the LAST `@` for the same reason.
+inline ninfer::RequestClass split_model_request_class(std::string& model) {
+    const std::string::size_type at = model.rfind('@');
+    if (at == std::string::npos) { return ninfer::RequestClass::Agents; }
+    const std::string_view tag(model.data() + at + 1, model.size() - at - 1);
+    ninfer::RequestClass request_class = ninfer::RequestClass::Agents;
+    if (tag == "main") {
+        request_class = ninfer::RequestClass::Main;
+    } else if (tag == "classifier") {
+        request_class = ninfer::RequestClass::Classifier;
+    } else if (tag != "agents") {
+        // Unrecognised tag: still strip the `@suffix` so validate_model sees the plain model id
+        // and the client does not get a 404 for a typo or a future tag this build does not know.
+        // TODO: decide whether unknown tags should map to a user-defined RequestClass or be
+        // rejected with a clear error instead of silently falling back to Agents.
+        model.erase(at);
+        return ninfer::RequestClass::Agents;
+    }
+    model.erase(at);
+    return request_class;
+}
+
 struct GenerationRequest {
     std::string model;
+    ninfer::RequestClass request_class = ninfer::RequestClass::Agents;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = 64;

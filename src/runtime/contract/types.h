@@ -12,6 +12,7 @@ using ::ninfer::FinishReason;
 using ::ninfer::KvCapacityMode;
 using ::ninfer::KvCapacityPolicy;
 using ::ninfer::OutputChannel;
+using ::ninfer::RequestClass;
 using ::ninfer::ResolvedSamplingParameters;
 using ::ninfer::StopPolicy;
 using ::ninfer::StopString;
@@ -23,6 +24,7 @@ struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    RequestClass request_class            = RequestClass::Agents;
 };
 
 struct ResolvedRequestOptions {

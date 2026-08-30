@@ -236,6 +236,11 @@ std::uint64_t Program<Variant>::retained_use_tick(std::uint32_t lane) const noex
 }
 
 template <>
+RequestClass Program<Variant>::retained_owner_class(std::uint32_t lane) const noexcept {
+    return impl_->retained_owner_class(lane);
+}
+
+template <>
 void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
     impl_->evict_retained_lane(lane);
 }

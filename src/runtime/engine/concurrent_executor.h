@@ -759,6 +759,20 @@ private:
         request->ram_index_version = version;
     }
 
+    // A retained lane owned by @main holds the long-lived agent conversation, and recycling or
+    // evicting it charges that conversation a full re-prefill on its next turn -- 98k tokens /
+    // 24.2s in the production trace that motivated this, spent so that a 487-token helper could
+    // land on the fattest lane (the fattest is exactly the one can_admit_lane finds feasible
+    // under page pressure, since it is the one whose release frees the most). So rank such a
+    // lane LAST among the candidates a request could take, never exclude it: every lane that is
+    // admissible today stays admissible, this only reorders the choice among them. Untagged
+    // traffic is entirely RequestClass::Agents, which makes the predicate constantly false.
+    [[nodiscard]] bool defers_to_main_lane(std::uint32_t lane,
+                                           RequestClass incoming) const noexcept {
+        return incoming != RequestClass::Main && instance_.program->has_retained_lane(lane) &&
+               instance_.program->retained_owner_class(lane) == RequestClass::Main;
+    }
+
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         ensure_ram_candidate(request);
@@ -776,9 +790,12 @@ private:
         const std::uint64_t ram_entry_id =
             ram_plan != nullptr ? ram_plan->summary().ram_entry_id : 0ULL;
 
+        const RequestClass incoming_class = request->options.execution.request_class;
+
         auto first_ram_lane = [&](bool after_eviction) -> std::optional<std::uint32_t> {
             std::optional<std::uint32_t> dirty;
             std::uint64_t dirty_tick = 0;
+            bool dirty_defers        = false;
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                 if (slots_[lane] != nullptr) { continue; }
                 const bool feasible =
@@ -788,9 +805,14 @@ private:
                 if (!feasible) { continue; }
                 if (!instance_.program->has_retained_lane(lane)) { return lane; }
                 const std::uint64_t tick = instance_.program->retained_use_tick(lane);
-                if (!dirty || tick < dirty_tick) {
-                    dirty      = lane;
-                    dirty_tick = tick;
+                const bool defers        = defers_to_main_lane(lane, incoming_class);
+                // Same fallback as before -- a retained lane is still returned when it is the
+                // only feasible one -- with @main's lane ranked behind the others.
+                if (!dirty || (dirty_defers && !defers) ||
+                    (defers == dirty_defers && tick < dirty_tick)) {
+                    dirty        = lane;
+                    dirty_tick   = tick;
+                    dirty_defers = defers;
                 }
             }
             return dirty;
@@ -799,21 +821,31 @@ private:
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
         bool selected_dirty          = false;
+        bool selected_defers         = false;
         auto consider_vram           = [&](std::uint32_t lane, std::uint32_t reuse, bool evict) {
-            const bool dirty = instance_.program->has_retained_lane(lane);
-            if (selected && reuse < selected_reuse) { return; }
-            if (selected && reuse == selected_reuse) {
-                if (!selected_dirty) { return; }
-                if (dirty) {
-                    const std::uint64_t selected_tick =
-                        instance_.program->retained_use_tick(selected->lane);
-                    const std::uint64_t tick = instance_.program->retained_use_tick(lane);
-                    if (tick >= selected_tick) { return; }
+            const bool dirty  = instance_.program->has_retained_lane(lane);
+            const bool defers = defers_to_main_lane(lane, incoming_class);
+            // Deference outranks reuse: a lane that only reuses is cheaper to give up than a
+            // 96k-token conversation is to rebuild. Within one deference level the ordering is
+            // unchanged -- most reuse, then a clean lane over a retained one, then oldest use.
+            if (selected && defers != selected_defers) {
+                if (defers) { return; }
+            } else if (selected) {
+                if (reuse < selected_reuse) { return; }
+                if (reuse == selected_reuse) {
+                    if (!selected_dirty) { return; }
+                    if (dirty) {
+                        const std::uint64_t selected_tick =
+                            instance_.program->retained_use_tick(selected->lane);
+                        const std::uint64_t tick = instance_.program->retained_use_tick(lane);
+                        if (tick >= selected_tick) { return; }
+                    }
                 }
             }
-            selected       = LaneChoice{.lane = lane, .evict_retained = evict, .ram_entry_id = 0};
-            selected_reuse = reuse;
-            selected_dirty = dirty;
+            selected        = LaneChoice{.lane = lane, .evict_retained = evict, .ram_entry_id = 0};
+            selected_reuse  = reuse;
+            selected_dirty  = dirty;
+            selected_defers = defers;
         };
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
@@ -826,12 +858,15 @@ private:
         }
         if (ram_plan != nullptr && ram_reuse > 0) {
             if (const std::optional<std::uint32_t> ram_lane = first_ram_lane(false); ram_lane) {
-                if (!selected || ram_reuse > selected_reuse) {
+                const bool defers = defers_to_main_lane(*ram_lane, incoming_class);
+                if (!selected || (selected_defers && !defers) ||
+                    (defers == selected_defers && ram_reuse > selected_reuse)) {
                     selected = LaneChoice{.lane           = *ram_lane,
                                           .evict_retained = false,
                                           .ram_entry_id   = ram_entry_id};
-                    selected_reuse = ram_reuse;
-                    selected_dirty = instance_.program->has_retained_lane(*ram_lane);
+                    selected_reuse  = ram_reuse;
+                    selected_dirty  = instance_.program->has_retained_lane(*ram_lane);
+                    selected_defers = defers;
                 }
             }
         }
@@ -840,8 +875,9 @@ private:
         // No lane can admit directly. Retry allowing retained eviction.
         //
         selected.reset();
-        selected_reuse = 0;
-        selected_dirty = false;
+        selected_reuse  = 0;
+        selected_dirty  = false;
+        selected_defers = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
@@ -853,7 +889,9 @@ private:
         }
         if (ram_plan != nullptr && ram_reuse > 0) {
             if (const std::optional<std::uint32_t> ram_lane = first_ram_lane(true); ram_lane) {
-                if (!selected || ram_reuse > selected_reuse) {
+                const bool defers = defers_to_main_lane(*ram_lane, incoming_class);
+                if (!selected || (selected_defers && !defers) ||
+                    (defers == selected_defers && ram_reuse > selected_reuse)) {
                     selected = LaneChoice{.lane           = *ram_lane,
                                           .evict_retained = true,
                                           .ram_entry_id   = ram_entry_id};
@@ -919,9 +957,11 @@ private:
 
         try {
             if (choice.evict_retained) {
+                const RequestClass incoming_class = request->options.execution.request_class;
                 while (!instance_.program->can_admit_lane(lane, winning_plan)) {
                     std::optional<std::uint32_t> victim;
                     std::uint64_t victim_tick = 0;
+                    bool victim_defers        = false;
                     for (std::uint32_t retained_lane = 0; retained_lane < max_concurrency_;
                          ++retained_lane) {
                         if (retained_lane == lane || slots_[retained_lane] != nullptr ||
@@ -930,9 +970,15 @@ private:
                         }
                         const std::uint64_t tick =
                             instance_.program->retained_use_tick(retained_lane);
-                        if (!victim || tick < victim_tick) {
-                            victim      = retained_lane;
-                            victim_tick = tick;
+                        const bool defers = defers_to_main_lane(retained_lane, incoming_class);
+                        // @main's lane is the last victim standing, not an excluded one: the
+                        // candidate set is unchanged, so the "did not make admission feasible"
+                        // invariant below stays exactly as reachable as it was (i.e. never).
+                        if (!victim || (victim_defers && !defers) ||
+                            (defers == victim_defers && tick < victim_tick)) {
+                            victim        = retained_lane;
+                            victim_tick   = tick;
+                            victim_defers = defers;
                         }
                     }
                     if (!victim) {

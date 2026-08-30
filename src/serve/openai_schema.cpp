@@ -598,6 +598,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
         }
         out.model = default_model_id;
     }
+    out.request_class = split_model_request_class(out.model);
 
     parse_tools(body, out);
     parse_tool_choice(body, out);

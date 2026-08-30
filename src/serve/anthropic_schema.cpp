@@ -521,7 +521,8 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
         body.at("model").get<std::string>().empty()) {
         bad_request("missing required field: model", "model");
     }
-    out.model = body.at("model").get<std::string>();
+    out.model         = body.at("model").get<std::string>();
+    out.request_class = split_model_request_class(out.model);
 
     parse_tools(body, out);
     parse_tool_choice(body, out);

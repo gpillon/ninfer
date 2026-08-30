@@ -174,10 +174,21 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+// Which caller class a request belongs to, carried on the wire as an `@tag` suffix on the model
+// id. It is advisory scheduling information only -- no capacity is reserved for a class, so a
+// client that sends no tag (or an unrecognised one) resolves to Agents and is scheduled exactly
+// as it was before the tag existed. Agents is deliberately the zero value for that reason.
+enum class RequestClass : std::uint8_t {
+    Agents = 0,
+    Main,
+    Classifier,
+};
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    RequestClass request_class            = RequestClass::Agents;
 };
 
 struct OutputOptions {

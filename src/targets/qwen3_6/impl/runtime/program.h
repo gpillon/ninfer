@@ -70,7 +70,8 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
-    bool allow_prefix_reuse = false;
+    bool allow_prefix_reuse                = false;
+    runtime::RequestClass owner_class      = runtime::RequestClass::Agents;
 };
 
 template <>
@@ -90,6 +91,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t backend_kv_page_entitlement = 0;
     PrefixReuseSource reuse_source            = PrefixReuseSource::None;
     std::uint64_t ram_entry_id                = 0;
+    runtime::RequestClass owner_class         = runtime::RequestClass::Agents;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -175,6 +177,10 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     std::uint64_t use_tick        = 0;
+    // Class of the request that last took this lane. It outlives that request together with the
+    // rest of the retained state, which is the point: admission consults it to decide whose
+    // conversation it is about to recycle.
+    runtime::RequestClass owner_class = runtime::RequestClass::Agents;
     RewriteCheckpoint rewrite_checkpoint;
 };
 
@@ -245,6 +251,7 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
+    [[nodiscard]] runtime::RequestClass retained_owner_class(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     // False while a KV dtype keeps an exact-key side store the record cannot carry, so no
     // host-RAM record is ever captured or matched in that configuration.

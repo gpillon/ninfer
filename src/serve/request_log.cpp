@@ -130,6 +130,18 @@ const char* prefix_reuse_source_name(ninfer::PrefixReuseSource source) {
     return "unknown";
 }
 
+const char* request_class_name(ninfer::RequestClass request_class) {
+    switch (request_class) {
+    case ninfer::RequestClass::Agents:
+        return "agents";
+    case ninfer::RequestClass::Main:
+        return "main";
+    case ninfer::RequestClass::Classifier:
+        return "classifier";
+    }
+    return "unknown";
+}
+
 const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
     switch (path) {
     case ninfer::PrefixReusePath::FullReset:
@@ -193,6 +205,7 @@ Json request_json(const RequestLogContext& context) {
     return Json{{"request_id", context.id},
                 {"protocol", context.protocol},
                 {"model", context.model},
+                {"request_class", request_class_name(context.request_class)},
                 {"stream", context.stream},
                 {"message_count", context.message_count},
                 {"media_item_count", context.media_item_count},
@@ -374,6 +387,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.id                                 = id;
     context.protocol                           = std::move(protocol);
     context.model                              = request.model;
+    context.request_class                      = request.request_class;
     context.stream                             = request.stream;
     context.message_count                      = request.messages.size();
     context.media_item_count                   = request.media_item_count();
@@ -481,7 +495,10 @@ std::string format_request_done(const RequestLogContext& context,
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
         << " wall=" << seconds_str(metrics.total_seconds)
-        << " speculative=" << speculative_str(metrics);
+        << " speculative=" << speculative_str(metrics)
+        // Appended last on purpose: existing fields keep their positions, so the log analysis
+        // that greps this line for ttft/cache/reuse keeps working while gaining a per-class cut.
+        << " class=" << request_class_name(context.request_class);
     return out.str();
 }
 

@@ -17,13 +17,14 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 13;
+inline constexpr int kRequestLogSchemaVersion        = 14;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
     std::uint64_t id = 0;
     std::string protocol;
     std::string model;
+    ninfer::RequestClass request_class      = ninfer::RequestClass::Agents;
     bool stream                             = false;
     std::size_t message_count               = 0;
     std::size_t media_item_count            = 0;

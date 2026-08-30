@@ -180,6 +180,9 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
+    // Class of the request that last occupied the lane, for lanes that still hold retained
+    // state; RequestClass::Agents (the default) for every other lane.
+    [[nodiscard]] RequestClass retained_owner_class(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
     [[nodiscard]] bool capture_active_lane_for_siblings(std::uint32_t lane);

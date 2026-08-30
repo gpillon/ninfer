@@ -684,6 +684,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request.lifecycle      = Lifecycle::Prefilling;
         const runtime::PrefillStepResult first = advance_prefill(sequence, request);
         sequence.use_tick                      = next_use_tick_++;
+        sequence.owner_class                   = request_plan.owner_class;
         return first;
     } catch (...) {
         try {
@@ -965,6 +966,10 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
 
 std::uint64_t ProgramImplCore::retained_use_tick(std::uint32_t lane) const noexcept {
     return has_retained_lane(lane) ? sequences[lane].use_tick : 0;
+}
+
+runtime::RequestClass ProgramImplCore::retained_owner_class(std::uint32_t lane) const noexcept {
+    return has_retained_lane(lane) ? sequences[lane].owner_class : runtime::RequestClass::Agents;
 }
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
@@ -1293,6 +1298,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
     sequence.use_tick                = 0;
+    sequence.owner_class             = runtime::RequestClass::Agents;
     sequence.rewrite_checkpoint      = {};
     request.pending                  = {};
     request.mtp_signal.reset();

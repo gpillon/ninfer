@@ -716,7 +716,8 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
         body.at("model").get<std::string>().empty()) {
         bad_request("missing required field: model", "model");
     }
-    out.generation.model = body.at("model").get<std::string>();
+    out.generation.model         = body.at("model").get<std::string>();
+    out.generation.request_class = split_model_request_class(out.generation.model);
     if (!body.contains("input")) { bad_request("missing required field: input", "input"); }
     parse_input(body.at("input"), out);
 
