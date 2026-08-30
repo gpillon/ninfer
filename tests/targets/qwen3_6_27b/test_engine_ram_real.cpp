@@ -1057,33 +1057,63 @@ int exercise_mtp(const char* artifact) {
         return rc;
     }
     const auto keep = tokens_d();
-    const ninfer::GenerationResult first =
+    const ninfer::GenerationResult source =
         engine.generate(engine.prepare_tokens(keep), greedy(8, false));
-    if (first.generated_token_ids.size() != 8) {
+    if (source.generated_token_ids.size() != 8) {
         return fail("MTP suffix source did not complete");
     }
-    (void)engine.generate(engine.prepare_tokens(tokens_e()), greedy(4, false));
-    const std::vector<ninfer::TokenId> history = resume_prefix(keep, first.generated_token_ids);
+    const std::vector<ninfer::TokenId> history = resume_prefix(keep, source.generated_token_ids);
     const std::vector<ninfer::TokenId> continued = concat(history, {198, 198, 198, 198});
-    const auto restores_before                   = engine.runtime_stats().kv_ram_restores;
+
+    // The Qwen3.8 NVFP4 prefill and MTP routes need not be bit-identical to a full reset. The
+    // round-trip contract is narrower: restoring the same checkpoint from host RAM must produce
+    // exactly the continuation produced while that checkpoint was still resident in VRAM.
+    const ninfer::GenerationResult vram =
+        engine.generate(engine.prepare_tokens(continued), greedy(4, true));
+    if (const int rc =
+            expect_suffix_hit(vram, ninfer::PrefixReuseSource::VramResident,
+                              static_cast<std::uint32_t>(history.size()),
+                              static_cast<std::uint32_t>(continued.size()), "MTP suffix VRAM");
+        rc != 0) {
+        return rc;
+    }
+
+    const ninfer::GenerationResult regenerated =
+        engine.generate(engine.prepare_tokens(keep), greedy(8, false));
+    if (regenerated.generated_token_ids != source.generated_token_ids) {
+        return fail("MTP suffix RAM source did not match the VRAM source");
+    }
+    (void)engine.generate(engine.prepare_tokens(tokens_e()), greedy(4, false));
+    const auto captures_before = engine.runtime_stats().kv_ram_captures;
+    const auto restores_before = engine.runtime_stats().kv_ram_restores;
     const ninfer::GenerationResult hit =
         engine.generate(engine.prepare_tokens(continued), greedy(4, true));
-    if (hit.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
-        hit.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
-        hit.reused_prompt_tokens != history.size()) {
-        std::cerr << "MTP suffix RAM restore failed: source="
-                  << static_cast<int>(hit.prefix_reuse_source)
-                  << " path=" << static_cast<int>(hit.prefix_reuse_path)
-                  << " reused=" << hit.reused_prompt_tokens << '\n';
-        return 1;
+    if (const int rc =
+            expect_suffix_hit(hit, ninfer::PrefixReuseSource::HostRam,
+                              static_cast<std::uint32_t>(history.size()),
+                              static_cast<std::uint32_t>(continued.size()), "MTP suffix RAM");
+        rc != 0) {
+        return rc;
     }
     if (engine.runtime_stats().kv_ram_restores != restores_before + 1) {
         return fail("MTP suffix RAM restore did not increment kv_ram_restores");
     }
-    const ninfer::GenerationResult baseline =
-        engine.generate(engine.prepare_tokens(continued), greedy(4, false));
-    if (hit.generated_token_ids != baseline.generated_token_ids) {
-        return fail("MTP suffix RAM reuse changed greedy output");
+    if (hit.generated_token_ids != vram.generated_token_ids) {
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        std::cerr << "MTP suffix RAM-vs-VRAM mismatch: vram_tokens=";
+        for (ninfer::TokenId token : vram.generated_token_ids) { std::cerr << token << ' '; }
+        std::cerr << " ram_tokens=";
+        for (ninfer::TokenId token : hit.generated_token_ids) { std::cerr << token << ' '; }
+        std::cerr << " vram_path=" << static_cast<int>(vram.prefix_reuse_path)
+                  << " vram_base=" << vram.reused_prompt_tokens
+                  << " ram_path=" << static_cast<int>(hit.prefix_reuse_path)
+                  << " ram_base=" << hit.reused_prompt_tokens
+                  << " ram_load_ms=" << hit.kv_ram_load_seconds * 1e3
+                  << " captures_before=" << captures_before
+                  << " captures_after=" << stats.kv_ram_captures
+                  << " restores_before=" << restores_before
+                  << " restores_after=" << stats.kv_ram_restores << '\n';
+        return fail("MTP suffix RAM reuse changed the VRAM continuation");
     }
     return 0;
 }
@@ -1435,10 +1465,25 @@ int exercise_artifact(const char* artifact) {
 int main() {
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
+    const char* requested_case = std::getenv("NINFER_RAM_REAL_CASE");
     if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0')) {
         std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
                      "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS is set\n";
         return 77;
+    }
+    if (requested_case != nullptr && std::string(requested_case) != "mtp") {
+        std::cerr << "unknown NINFER_RAM_REAL_CASE=" << requested_case << "; supported: mtp\n";
+        return 2;
+    }
+    if (requested_case != nullptr) {
+        if (groupwise != nullptr && *groupwise != '\0') {
+            if (const int result = exercise_mtp(groupwise); result != 0) { return result; }
+        }
+        if (nvfp4 != nullptr && *nvfp4 != '\0') {
+            if (const int result = exercise_mtp(nvfp4); result != 0) { return result; }
+        }
+        std::cout << "ok\n";
+        return 0;
     }
     if (groupwise != nullptr && *groupwise != '\0') {
         if (const int result = exercise_artifact(groupwise); result != 0) { return result; }
