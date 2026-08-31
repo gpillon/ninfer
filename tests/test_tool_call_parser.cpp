@@ -78,7 +78,10 @@ int test_malformed_falls_back_to_text() {
     return failures;
 }
 
-int test_suffix_after_tool_falls_back_to_text() {
+int test_suffix_after_tool_becomes_content() {
+    // A well-formed call followed by non-whitespace prose: the call is salvaged and the suffix
+    // becomes content. It is never a fallback to raw text -- the parser's contract is that once a
+    // <tool_call> marker is confirmed, its XML is never echoed to the client.
     const std::string text = "<tool_call>\n"
                              "<function=get_weather>\n"
                              "<parameter=city>\nParis\n</parameter>\n"
@@ -88,8 +91,13 @@ int test_suffix_after_tool_falls_back_to_text() {
     const ninfer::serve::ParsedToolCallOutput parsed =
         ninfer::serve::parse_qwen_tool_call_output(text, 64);
     int failures = 0;
-    failures += check(!parsed.is_tool_call_response, "non-whitespace suffix falls back to text");
-    failures += check(parsed.content == text, "suffix fallback preserves text");
+    failures += check(parsed.is_tool_call_response, "suffix after a valid call keeps tool response");
+    failures += check(parsed.tool_calls.size() == 1, "suffix after a valid call keeps one call");
+    failures += check(parsed.tool_calls.size() == 1 && parsed.tool_calls[0].name == "get_weather",
+                      "salvaged call name with a suffix");
+    failures += check(parsed.content == "extra answer", "suffix kept verbatim as content");
+    failures += check(parsed.content.find("<tool_call>") == std::string::npos,
+                      "tool-call xml leaked into content alongside the suffix");
     return failures;
 }
 
@@ -298,7 +306,7 @@ int main() {
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
     failures += test_malformed_falls_back_to_text();
-    failures += test_suffix_after_tool_falls_back_to_text();
+    failures += test_suffix_after_tool_becomes_content();
     failures += test_configured_name_limit();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
