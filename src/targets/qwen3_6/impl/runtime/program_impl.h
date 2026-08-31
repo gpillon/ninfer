@@ -1975,13 +1975,13 @@ void ProgramImplCore::prepare_graphs() {
         const auto batch_one_profiles = dflash_graph_profiles(capacity, draft_window, 1);
         validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash2");
         schedule::DFlash2BatchContext dflash2_state{
-            execution_core(),     decoder->text_kv,    *dflash2,         *io.dflash_decode,
+            execution_core(&*replay_records), decoder->text_kv, *dflash2, *io.dflash_decode,
             *dflash_host_ingress, *dflash_host_egress, tail_hidden_store};
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                    capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
-        prepare_representative(code_warm.min, 1);
+        prepare_representative(code_warm.min, 1, 0);
         device.synchronize();
         schedule::dflash2_decode_batch(dflash2_state, 1, draft_window,
                                        dflash2_envelopes(code_warm.min, code_warm.max, draft_window),
