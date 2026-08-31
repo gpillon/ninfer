@@ -341,6 +341,26 @@ void* HostPinnedArena::try_alloc(std::size_t bytes, std::size_t align) {
     return nullptr;
 }
 
+bool HostPinnedArena::can_alloc(std::size_t bytes, std::size_t align) const {
+    if (base_ == nullptr) { throw std::runtime_error("HostPinnedArena has no backing allocation"); }
+    if (!is_power_of_two(align)) {
+        throw std::invalid_argument("arena alignment must be a nonzero power of two");
+    }
+    if (bytes == 0) { throw std::invalid_argument("arena allocation must be nonzero"); }
+    if (bytes > cap_) { return false; }
+
+    const std::uintptr_t base_addr = reinterpret_cast<std::uintptr_t>(base_);
+    for (const FreeSpan& span : free_) {
+        const std::uintptr_t span_addr    = checked_add_uintptr(base_addr, span.offset);
+        const std::uintptr_t aligned_addr = align_up_addr(span_addr, align);
+        const std::uintptr_t lead_addr    = aligned_addr - span_addr;
+        if (lead_addr > std::numeric_limits<std::size_t>::max()) { continue; }
+        const auto lead = static_cast<std::size_t>(lead_addr);
+        if (lead <= span.size && bytes <= span.size - lead) { return true; }
+    }
+    return false;
+}
+
 void HostPinnedArena::free(void* block) {
     if (block == nullptr) { throw std::invalid_argument("HostPinnedArena free of null"); }
     const auto it = live_.find(block);

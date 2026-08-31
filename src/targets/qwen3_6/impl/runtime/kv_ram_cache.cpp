@@ -177,6 +177,120 @@ std::size_t header_bytes_for(std::uint32_t text_planes, std::uint32_t backend_pl
     return align_up(kFixedHeader + kFingerprint * (text_planes + backend_planes), kHostAlign);
 }
 
+HeaderView make_capture_header(const RamCaptureSource& source) {
+    if (source.identity == nullptr || source.text_pool == nullptr) {
+        throw std::invalid_argument("RAM capture source is incomplete");
+    }
+    if ((source.backend == nullptr) != (source.backend_pool == nullptr) && source.backend != nullptr) {
+        throw std::invalid_argument("RAM capture backend source is inconsistent");
+    }
+    if (source.ledger.size() != source.ledger_frontier ||
+        source.ledger_frontier != source.execution_frontier + 1) {
+        throw std::logic_error("RAM capture ledger frontier is inconsistent");
+    }
+
+    HeaderView header;
+    header.execution_frontier      = source.execution_frontier;
+    header.ledger_frontier         = source.ledger_frontier;
+    header.rope_delta              = source.rope_delta;
+    header.text_kv_valid           = source.text_kv_valid;
+    header.mtp_kv_valid            = source.mtp_kv_valid;
+    header.dflash_context_frontier = source.dflash_context_frontier;
+    header.tail_hidden_valid       = source.tail_hidden_valid;
+    header.rewrite_valid           = source.rewrite_valid;
+    header.rewrite_kind            = source.rewrite_kind;
+    header.hash_c_valid            = source.hash_c_valid;
+    header.rewrite_frontier        = source.rewrite_frontier;
+    header.text_mapped_pages       = source.text_pages;
+    header.backend_mapped_pages    = source.backend_pages;
+    header.text_plane_count        = static_cast<std::uint32_t>(source.text_pool->plane_count());
+    header.backend_plane_count     =
+        source.backend_pool ? static_cast<std::uint32_t>(source.backend_pool->plane_count()) : 0;
+    header.hash_f                  = source.hash_f;
+    header.hash_c                  = source.hash_c;
+    header.has_gdn                 = source.gdn != nullptr;
+    header.has_dflash              = source.dflash_local != nullptr;
+    if (source.dflash_local != nullptr) {
+        header.cyclic_layers        = source.dflash_local->layer_count();
+        header.cyclic_capacity      = source.dflash_local->capacity();
+        header.cyclic_padded        = source.dflash_local->padded_capacity();
+        header.cyclic_kv_heads      = source.dflash_local->num_kv_heads();
+        header.cyclic_head_dim      = source.dflash_local->head_dim();
+        header.cyclic_lane_capacity = source.dflash_local->lane_capacity();
+        header.cyclic_lane_bytes    = source.dflash_local->lane_host_bytes();
+    }
+    if (source.tail_hidden != nullptr) { header.tail_hidden_bytes = source.tail_hidden->bytes(); }
+    if (source.gdn != nullptr) {
+        header.gdn_conv_bytes      = source.gdn->conv_host_image_bytes();
+        header.gdn_recurrent_bytes = source.gdn->recurrent_host_image_bytes();
+    }
+    const bool text_residual = source.text_cache != nullptr && source.text_cache->residual_enabled();
+    const bool backend_residual =
+        source.backend_pool != nullptr && source.backend_cache != nullptr &&
+        source.backend_cache->residual_enabled();
+    if ((text_residual || backend_residual) && source.residual_row < 0) {
+        throw std::logic_error("RAM capture needs the residual slot row");
+    }
+    if (text_residual) {
+        header.text_residual_slot_bytes = source.text_cache->residual_slot_host_bytes();
+        header.ring_valid_slot_bytes    = source.text_cache->ring_valid_slot_host_bytes();
+    }
+    if (backend_residual) {
+        header.backend_residual_slot_bytes = source.backend_cache->residual_slot_host_bytes();
+        header.ring_valid_slot_bytes       = source.backend_cache->ring_valid_slot_host_bytes();
+    }
+    return header;
+}
+
+std::array<std::size_t, kSectionCount> finalize_capture_layout(const RamCaptureSource& source,
+                                                                HeaderView& header) {
+    const bool text_residual = source.text_cache != nullptr && source.text_cache->residual_enabled();
+    const bool backend_residual =
+        source.backend_pool != nullptr && source.backend_cache != nullptr &&
+        source.backend_cache->residual_enabled();
+    std::array<std::size_t, kSectionCount> lengths{};
+    std::array<std::size_t, kSectionCount> aligns{};
+    lengths[0] = source.ledger.size() * sizeof(TokenId);
+    lengths[1] = source.identity->packed_bytes();
+    lengths[2] = paged_kv_host_image_bytes(*source.text_pool, header.text_mapped_pages);
+    lengths[3] = source.backend_pool
+                     ? paged_kv_host_image_bytes(*source.backend_pool, header.backend_mapped_pages)
+                     : 0;
+    lengths[4] = source.gdn ? source.gdn->conv_host_image_bytes() : 0;
+    lengths[5] = source.gdn && source.rewrite_valid ? source.gdn->conv_host_image_bytes() : 0;
+    lengths[6] = source.gdn ? source.gdn->recurrent_host_image_bytes() : 0;
+    lengths[7] = source.gdn && source.rewrite_valid ? source.gdn->recurrent_host_image_bytes() : 0;
+    lengths[8] = source.tail_hidden ? source.tail_hidden->bytes() : 0;
+    lengths[9] = source.rewrite_valid && source.rewrite_checkpoint_hidden
+                     ? source.rewrite_checkpoint_hidden->bytes()
+                     : 0;
+    lengths[10] = source.dflash_local ? source.dflash_local->lane_host_bytes() : 0;
+    lengths[11] = source.dflash_checkpoint && source.rewrite_valid
+                      ? source.dflash_checkpoint->lane_host_bytes()
+                      : 0;
+    lengths[12] = text_residual ? header.text_residual_slot_bytes : 0;
+    lengths[13] = lengths[12];
+    lengths[14] = text_residual ? header.ring_valid_slot_bytes : 0;
+    lengths[15] = backend_residual ? header.backend_residual_slot_bytes : 0;
+    lengths[16] = lengths[15];
+    lengths[17] = backend_residual ? header.ring_valid_slot_bytes : 0;
+    aligns[0] = kHostAlign;
+    aligns[1] = kHostAlign;
+    for (std::size_t i = 2; i < kSectionCount; ++i) { aligns[i] = kDeviceAlign; }
+
+    header.header_bytes = header_bytes_for(header.text_plane_count, header.backend_plane_count);
+    std::size_t cursor  = header.header_bytes;
+    for (std::size_t i = 0; i < kSectionCount; ++i) {
+        if (lengths[i] == 0) { continue; }
+        cursor           = align_up(cursor, aligns[i]);
+        header.offset[i] = cursor;
+        header.length[i] = lengths[i];
+        cursor += lengths[i];
+    }
+    header.entry_bytes = align_up(cursor, kDeviceAlign);
+    return lengths;
+}
+
 void write_fixed_header(Cursor& w, const HeaderView& h) {
     w.u32(kRamMagic);
     w.u32(kRamVersion);
@@ -672,7 +786,32 @@ KvRamSnapshot KVRamCache::snapshot() const noexcept {
     };
 }
 
-bool KVRamCache::capture(const RamCaptureSource& source) {
+std::size_t KVRamCache::capture_bytes(const RamCaptureSource& source) const {
+    HeaderView header = make_capture_header(source);
+    (void)finalize_capture_layout(source, header);
+    return header.entry_bytes;
+}
+
+bool KVRamCache::has_room_for_dynamic_boundary_without_eviction() const noexcept {
+    std::uint32_t live = 0;
+    for (std::uint64_t id : fifo_) {
+        const auto it = records_.find(id);
+        if (it != records_.end() && it->second.capture_kind == RamCaptureKind::DynamicBoundary) {
+            ++live;
+        }
+    }
+    return live < kMaxDynamicBoundaryRecords;
+}
+
+bool KVRamCache::can_capture_without_eviction(const RamCaptureSource& source) {
+    reap_retired(false);
+    const std::size_t bytes = capture_bytes(source);
+    if (!arena_.can_alloc(bytes, kDeviceAlign)) { return false; }
+    return source.capture_kind != RamCaptureKind::DynamicBoundary ||
+           has_room_for_dynamic_boundary_without_eviction();
+}
+
+bool KVRamCache::capture(const RamCaptureSource& source, RamCapturePolicy policy) {
     if (source.identity == nullptr || source.text == nullptr || source.text_pool == nullptr) {
         throw std::invalid_argument("RAM capture source is incomplete");
     }
@@ -691,102 +830,10 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         throw std::logic_error("RAM capture ledger frontier is inconsistent");
     }
 
-    HeaderView header;
-    header.execution_frontier      = source.execution_frontier;
-    header.ledger_frontier         = source.ledger_frontier;
-    header.rope_delta              = source.rope_delta;
-    header.text_kv_valid           = source.text_kv_valid;
-    header.mtp_kv_valid            = source.mtp_kv_valid;
-    header.dflash_context_frontier = source.dflash_context_frontier;
-    header.tail_hidden_valid       = source.tail_hidden_valid;
-    header.rewrite_valid           = source.rewrite_valid;
-    header.rewrite_kind            = source.rewrite_kind;
-    header.hash_c_valid            = source.hash_c_valid;
-    header.rewrite_frontier        = source.rewrite_frontier;
-    header.text_mapped_pages       = source.text_pages;
-    header.backend_mapped_pages    = source.backend_pages;
-    header.text_plane_count        = static_cast<std::uint32_t>(source.text_pool->plane_count());
-    header.backend_plane_count     =
-        source.backend_pool ? static_cast<std::uint32_t>(source.backend_pool->plane_count()) : 0;
-    header.hash_f                  = source.hash_f;
-    header.hash_c                  = source.hash_c;
-    header.has_gdn                 = source.gdn != nullptr;
-    header.has_dflash              = source.dflash_local != nullptr;
-    if (source.dflash_local != nullptr) {
-        header.cyclic_layers       = source.dflash_local->layer_count();
-        header.cyclic_capacity     = source.dflash_local->capacity();
-        header.cyclic_padded       = source.dflash_local->padded_capacity();
-        header.cyclic_kv_heads     = source.dflash_local->num_kv_heads();
-        header.cyclic_head_dim     = source.dflash_local->head_dim();
-        header.cyclic_lane_capacity = source.dflash_local->lane_capacity();
-        header.cyclic_lane_bytes   = source.dflash_local->lane_host_bytes();
-    }
-    if (source.tail_hidden != nullptr) { header.tail_hidden_bytes = source.tail_hidden->bytes(); }
-    if (source.gdn != nullptr) {
-        header.gdn_conv_bytes      = source.gdn->conv_host_image_bytes();
-        header.gdn_recurrent_bytes = source.gdn->recurrent_host_image_bytes();
-    }
-    // The exact-key side store lives outside the paged pool and is indexed by slot row, so a
-    // record that omits it would leave a restored sequence reading the row's previous tenant.
-    const bool text_residual =
-        source.text_cache != nullptr && source.text_cache->residual_enabled();
-    const bool backend_residual =
-        source.backend != nullptr && source.backend_cache != nullptr &&
-        source.backend_cache->residual_enabled();
-    if ((text_residual || backend_residual) && source.residual_row < 0) {
-        throw std::logic_error("RAM capture needs the residual slot row");
-    }
-    if (text_residual) {
-        header.text_residual_slot_bytes = source.text_cache->residual_slot_host_bytes();
-        header.ring_valid_slot_bytes    = source.text_cache->ring_valid_slot_host_bytes();
-    }
-    if (backend_residual) {
-        header.backend_residual_slot_bytes = source.backend_cache->residual_slot_host_bytes();
-        header.ring_valid_slot_bytes       = source.backend_cache->ring_valid_slot_host_bytes();
-    }
-
-    std::array<std::size_t, kSectionCount> lengths{};
-    std::array<std::size_t, kSectionCount> aligns{};
-    lengths[0] = source.ledger.size() * sizeof(TokenId);
-    lengths[1] = source.identity->packed_bytes();
-    lengths[2] = paged_kv_host_image_bytes(*source.text_pool, header.text_mapped_pages);
-    lengths[3] = source.backend_pool
-                     ? paged_kv_host_image_bytes(*source.backend_pool, header.backend_mapped_pages)
-                     : 0;
-    lengths[4] = source.gdn ? source.gdn->conv_host_image_bytes() : 0;
-    lengths[5] = source.gdn && source.rewrite_valid ? source.gdn->conv_host_image_bytes() : 0;
-    lengths[6] = source.gdn ? source.gdn->recurrent_host_image_bytes() : 0;
-    lengths[7] = source.gdn && source.rewrite_valid ? source.gdn->recurrent_host_image_bytes() : 0;
-    lengths[8] = source.tail_hidden ? source.tail_hidden->bytes() : 0;
-    lengths[9] = source.rewrite_valid && source.rewrite_checkpoint_hidden
-                     ? source.rewrite_checkpoint_hidden->bytes()
-                     : 0;
-    lengths[10] = source.dflash_local ? source.dflash_local->lane_host_bytes() : 0;
-    lengths[11] = source.dflash_checkpoint && source.rewrite_valid
-                      ? source.dflash_checkpoint->lane_host_bytes()
-                      : 0;
-    lengths[12] = text_residual ? header.text_residual_slot_bytes : 0;
-    lengths[13] = lengths[12];
-    lengths[14] = text_residual ? header.ring_valid_slot_bytes : 0;
-    lengths[15] = backend_residual ? header.backend_residual_slot_bytes : 0;
-    lengths[16] = lengths[15];
-    lengths[17] = backend_residual ? header.ring_valid_slot_bytes : 0;
-    aligns[0] = kHostAlign;
-    aligns[1] = kHostAlign;
-    for (std::size_t i = 2; i < kSectionCount; ++i) { aligns[i] = kDeviceAlign; }
-
-    const std::size_t header_bytes =
-        header_bytes_for(header.text_plane_count, header.backend_plane_count);
-    std::size_t cursor = header_bytes;
-    for (std::size_t i = 0; i < kSectionCount; ++i) {
-        if (lengths[i] == 0) { continue; }
-        cursor          = align_up(cursor, aligns[i]);
-        header.offset[i] = cursor;
-        header.length[i] = lengths[i];
-        cursor += lengths[i];
-    }
-    header.entry_bytes  = align_up(cursor, kDeviceAlign);
-    header.header_bytes = header_bytes;
+    HeaderView header = make_capture_header(source);
+    const std::array<std::size_t, kSectionCount> lengths =
+        finalize_capture_layout(source, header);
+    const std::size_t header_bytes = header.header_bytes;
 
     if (header.entry_bytes > arena_.capacity()) {
         ++drops_;
@@ -797,7 +844,9 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
     // DynamicBoundary record for a capture that could never succeed regardless (oversized entry,
     // or a source invariant that would have thrown above) would waste it for nothing.
     if (source.capture_kind == RamCaptureKind::DynamicBoundary &&
-        !make_room_for_dynamic_boundary()) {
+        (policy == RamCapturePolicy::PreserveExisting
+             ? !has_room_for_dynamic_boundary_without_eviction()
+             : !make_room_for_dynamic_boundary())) {
         ++drops_;
         bump_version();
         return false;
@@ -809,7 +858,7 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         reap_retired(true);
         block = arena_.try_alloc(header.entry_bytes, kDeviceAlign);
     }
-    while (block == nullptr) {
+    while (block == nullptr && policy == RamCapturePolicy::AllowEviction) {
         const std::size_t before = records_.size();
         evict_unpinned();
         if (records_.size() == before) {
@@ -818,6 +867,11 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
             return false;
         }
         block = arena_.try_alloc(header.entry_bytes, kDeviceAlign);
+    }
+    if (block == nullptr) {
+        ++drops_;
+        bump_version();
+        return false;
     }
 
     bool copies_launched = false;

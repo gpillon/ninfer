@@ -86,6 +86,7 @@ void fill_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocati
             }
         }
         CUDA_CHECK(cudaMemcpy(tensor.data, host.data(), host.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 }
 
@@ -230,7 +231,10 @@ int capture_text_entry(
     std::uint32_t capture_pages = std::numeric_limits<std::uint32_t>::max(),
     bool multi_claim = false, ninfer::RequestClass owner_class = ninfer::RequestClass::Agents,
     ninfer::targets::qwen3_6::detail::RamCaptureKind capture_kind =
-        ninfer::targets::qwen3_6::detail::RamCaptureKind::Terminal) {
+        ninfer::targets::qwen3_6::detail::RamCaptureKind::Terminal,
+    ninfer::targets::qwen3_6::detail::RamCapturePolicy policy =
+        ninfer::targets::qwen3_6::detail::RamCapturePolicy::AllowEviction,
+    std::size_t* expected_bytes = nullptr) {
     ninfer::targets::qwen3_6::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
@@ -270,7 +274,8 @@ int capture_text_entry(
     source.multi_claim = multi_claim;
     source.owner_class = owner_class;
     source.capture_kind = capture_kind;
-    return cache.capture(source) ? 0 : 1;
+    if (expected_bytes != nullptr) { *expected_bytes = cache.capture_bytes(source); }
+    return cache.capture(source, policy) ? 0 : 1;
 }
 
 int expect_logical_page(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocation& allocation,
@@ -372,6 +377,62 @@ int test_residual_slot_round_trip(ninfer::DeviceContext& ctx) {
         ++failures;
         std::cerr << "residual slot unpack disturbed an unrelated row\n";
     }
+
+    // The exact-key side store lives outside the paged pool, so an admission preflight that sizes
+    // only the pool under-quotes an hq record by two slot images plus the ring-valid image. Size
+    // and capture the same source and require the arena to land on the quoted number.
+    {
+        auto alloc = cache.pool().reserve(1);
+        alloc.materialize_pages(1, ctx.stream);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+
+        const auto prompt                = text_prompt({11, 12, 13});
+        q36::PreparedPromptData retained = prompt;
+        retained.token_ids.push_back(0);
+        retained.token_types.push_back(0);
+        const std::size_t tokens = retained.token_ids.size();
+        retained.positions.resize(3 * tokens);
+        for (int axis = 0; axis < 3; ++axis) {
+            for (std::size_t i = 0; i < tokens; ++i) {
+                retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                    static_cast<std::int32_t>(i);
+            }
+        }
+        q36::detail::ResidentPrefixIdentity identity;
+        identity.assign(retained);
+
+        q36::detail::RamCaptureSource source;
+        source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+        source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+        source.text_kv_valid      = source.execution_frontier;
+        source.ledger             = retained.token_ids;
+        source.identity           = &identity;
+        source.hash_f = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                    source.execution_frontier);
+        source.text       = &alloc;
+        source.text_pool  = &cache.pool();
+        source.text_pages = alloc.mapped_page_count();
+        source.stream     = ctx.stream;
+
+        q36::detail::KVRamCache sized(8ULL << 20);
+        const std::size_t pool_only = sized.capture_bytes(source);
+        source.text_cache           = &cache;
+        source.residual_row         = 1;
+        const std::size_t with_side_store = sized.capture_bytes(source);
+        if (with_side_store < pool_only + 2 * slot_bytes + ring_bytes) {
+            ++failures;
+            std::cerr << "hq residual side store is missing from the capture footprint\n";
+        }
+        if (!sized.capture(source)) {
+            ++failures;
+            std::cerr << "hq residual capture failed\n";
+        } else if (sized.snapshot().used_bytes != with_side_store) {
+            ++failures;
+            std::cerr << "hq residual preflight size disagrees with the captured record\n";
+        }
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        alloc.release();
+    }
     return failures;
 }
 
@@ -390,15 +451,20 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     const auto chain_c  = q36::detail::prefix_hash_chain(prompt_c);
 
     q36::detail::KVRamCache probe(8ULL << 20);
-    if (capture_text_entry(probe, pool, alloc, prompt_a, ctx.stream) != 0) {
+    std::size_t expected_entry_bytes = 0;
+    if (capture_text_entry(probe, pool, alloc, prompt_a, ctx.stream, 0,
+                           std::numeric_limits<std::uint32_t>::max(), false,
+                           ninfer::RequestClass::Agents, q36::detail::RamCaptureKind::Terminal,
+                           q36::detail::RamCapturePolicy::AllowEviction,
+                           &expected_entry_bytes) != 0) {
         std::cerr << "RAM probe capture failed\n";
         alloc.release();
         return 1;
     }
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
     const std::size_t entry_bytes = probe.snapshot().used_bytes;
-    if (entry_bytes == 0) {
-        std::cerr << "RAM probe capture used zero bytes\n";
+    if (entry_bytes == 0 || entry_bytes != expected_entry_bytes) {
+        std::cerr << "RAM preflight size disagrees with the captured record\n";
         alloc.release();
         return 1;
     }
@@ -800,6 +866,44 @@ int test_dynamic_boundary_cap(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& p
             ++failures;
             std::cerr << "dynamic-boundary cap did not evict the oldest record\n";
         }
+    }
+
+    // Admission-selected boundaries use PreserveExisting: the same cap must now reject the third
+    // entry even while an ordinary cache capture would be allowed to replace the coldest one.
+    q36::detail::KVRamCache preserved(prefix_bytes * 4 + 256);
+    if (capture_text_entry(preserved, pool, source, prompt_a, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Agents,
+                           q36::detail::RamCaptureKind::DynamicBoundary) != 0 ||
+        capture_text_entry(preserved, pool, source, prompt_b, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Agents,
+                           q36::detail::RamCaptureKind::DynamicBoundary) != 0 ||
+        capture_text_entry(preserved, pool, source, prompt_c, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Agents,
+                           q36::detail::RamCaptureKind::DynamicBoundary,
+                           q36::detail::RamCapturePolicy::PreserveExisting) == 0 ||
+        !preserved.plan_match(prompt_a, chain_a) || !preserved.plan_match(prompt_b, chain_b) ||
+        preserved.plan_match(prompt_c, chain_c) || preserved.snapshot().evictions != 0) {
+        ++failures;
+        std::cerr << "non-evicting dynamic-boundary admission displaced a live record\n";
+    }
+
+    // Byte pressure follows the same contract independently of the DynamicBoundary count cap.
+    q36::detail::KVRamCache byte_pressure(prefix_bytes * 2 + 256);
+    if (capture_text_entry(byte_pressure, pool, source, prompt_a, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Agents,
+                           q36::detail::RamCaptureKind::ActiveSibling) != 0 ||
+        capture_text_entry(byte_pressure, pool, source, prompt_b, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Agents,
+                           q36::detail::RamCaptureKind::ActiveSibling) != 0 ||
+        capture_text_entry(byte_pressure, pool, source, prompt_c, ctx.stream, 0, 1, false,
+                           ninfer::RequestClass::Agents,
+                           q36::detail::RamCaptureKind::ActiveSibling,
+                           q36::detail::RamCapturePolicy::PreserveExisting) == 0 ||
+        !byte_pressure.plan_match(prompt_a, chain_a) ||
+        !byte_pressure.plan_match(prompt_b, chain_b) ||
+        byte_pressure.plan_match(prompt_c, chain_c) || byte_pressure.snapshot().evictions != 0) {
+        ++failures;
+        std::cerr << "non-evicting byte-pressure admission displaced a live record\n";
     }
 
     // (2) A, B multi_claim so a consume() hit touches without erasing. Touch A, then a third
@@ -1399,9 +1503,11 @@ int test_restore_throw_then_replay(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     identity.assign(retained);
     ninfer::DeviceBuffer hidden_buf(128);
     hidden_buf.fill(0xb1);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
     ninfer::DeviceBuffer rewrite_buf(128);
     rewrite_buf.fill(0xb2);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {128});
     q36::detail::RamCaptureSource cap;
     cap.execution_frontier        = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -1433,9 +1539,11 @@ int test_restore_throw_then_replay(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     dest.materialize_pages(2, ctx.stream);
     ninfer::DeviceBuffer hidden_out_buf(128);
     hidden_out_buf.fill(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {128});
     ninfer::DeviceBuffer rewrite_bad_buf(64);
     rewrite_bad_buf.fill(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::Tensor rewrite_bad(rewrite_bad_buf.p, ninfer::DType::U8, {64});
     const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) {
@@ -1465,8 +1573,10 @@ int test_restore_throw_then_replay(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     dest2.materialize_pages(2, ctx.stream);
     ninfer::DeviceBuffer rewrite_ok_buf(128);
     rewrite_ok_buf.fill(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::Tensor rewrite_ok(rewrite_ok_buf.p, ninfer::DType::U8, {128});
     hidden_out_buf.fill(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
     q36::detail::RamRestoreTarget ok;
     ok.text                      = &dest2;
     ok.text_pool                 = &pool;
@@ -1624,37 +1734,48 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     }
     CUDA_CHECK(cudaMemcpy(gdn.conv_slot(0, 0).data, conv_cur.data(), conv_cur.size(),
                            cudaMemcpyHostToDevice));
+                           CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(gdn.conv_slot(2, 0).data, conv_cur.data(), conv_cur.size(),
                            cudaMemcpyHostToDevice));
+                           CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(gdn.conv_slot(0, 1).data, conv_ckpt.data(), conv_ckpt.size(),
                            cudaMemcpyHostToDevice));
+                           CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<unsigned char> rec_cur(gdn.recurrent_slot(0, 0).bytes(), 0x21);
     std::vector<unsigned char> rec_ckpt(gdn.recurrent_slot(0, 1).bytes(), 0x22);
     CUDA_CHECK(cudaMemcpy(gdn.recurrent_slot(1, 0).data, rec_cur.data(), rec_cur.size(),
                            cudaMemcpyHostToDevice));
+                           CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(gdn.recurrent_slot(1, 1).data, rec_ckpt.data(), rec_ckpt.size(),
                            cudaMemcpyHostToDevice));
+                           CUDA_CHECK(cudaDeviceSynchronize());
 
     ninfer::CyclicKVCacheLayerView local_view = dflash_local.layer_view(0);
     std::vector<unsigned char> k_local(local_view.k.slice(3, 0, 1).bytes(), 0x3c);
     std::vector<unsigned char> v_local(local_view.v.slice(3, 0, 1).bytes(), 0x3d);
     CUDA_CHECK(cudaMemcpy(local_view.k.slice(3, 0, 1).data, k_local.data(), k_local.size(),
                            cudaMemcpyHostToDevice));
+                           CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(local_view.v.slice(3, 0, 1).data, v_local.data(), v_local.size(),
                            cudaMemcpyHostToDevice));
+                           CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::CyclicKVCacheLayerView ckpt_view = dflash_ckpt.layer_view(0);
     std::vector<unsigned char> k_ckpt(ckpt_view.k.slice(3, 0, 1).bytes(), 0x4c);
     std::vector<unsigned char> v_ckpt(ckpt_view.v.slice(3, 0, 1).bytes(), 0x4d);
     CUDA_CHECK(cudaMemcpy(ckpt_view.k.slice(3, 0, 1).data, k_ckpt.data(), k_ckpt.size(),
                            cudaMemcpyHostToDevice));
+                           CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(ckpt_view.v.slice(3, 0, 1).data, v_ckpt.data(), v_ckpt.size(),
                            cudaMemcpyHostToDevice));
+                           CUDA_CHECK(cudaDeviceSynchronize());
 
     ninfer::DeviceBuffer hidden_buf(128);
     hidden_buf.fill(0xa1);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
     ninfer::DeviceBuffer rewrite_buf(128);
     rewrite_buf.fill(0xa2);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {128});
 
     const auto prompt = text_prompt({1, 2, 3, 4});
@@ -1703,7 +1824,11 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     source.dflash_lane        = 0;
     source.stream             = ctx.stream;
     q36::detail::KVRamCache cache(16ULL << 20);
+    const std::size_t expected_capture_bytes = cache.capture_bytes(source);
     if (!cache.capture(source)) { return fail("full-state capture failed"); }
+    if (cache.snapshot().used_bytes != expected_capture_bytes) {
+        return fail("full-state preflight size disagrees with the captured record");
+    }
 
     auto text_dest = text_pool.reserve(2);
     text_dest.materialize_pages(2, ctx.stream);
@@ -1711,9 +1836,11 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     backend_dest.materialize_pages(1, ctx.stream);
     ninfer::DeviceBuffer hidden_out_buf(128);
     hidden_out_buf.fill(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {128});
     ninfer::DeviceBuffer rewrite_out_buf(128);
     rewrite_out_buf.fill(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::Tensor rewrite_out(rewrite_out_buf.p, ninfer::DType::U8, {128});
     const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) { return fail("full-state capture did not match"); }
@@ -1924,10 +2051,12 @@ int main() {
             pattern[i] = static_cast<unsigned char>(i * 3 + 1);
         }
         CUDA_CHECK(cudaMemcpy(conv.data, pattern.data(), pattern.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaDeviceSynchronize());
         const ninfer::Tensor rec = gdn.recurrent_slot(1, 0);
         std::vector<unsigned char> rec_pattern(rec.bytes(), 0xab);
         CUDA_CHECK(
             cudaMemcpy(rec.data, rec_pattern.data(), rec_pattern.size(), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<unsigned char> conv_host(gdn.conv_host_image_bytes());
         std::vector<unsigned char> rec_host(gdn.recurrent_host_image_bytes());
         gdn.pack_slot_to_host(0, conv_host.data(), rec_host.data(), ctx.stream);
@@ -1960,9 +2089,11 @@ int main() {
         std::vector<unsigned char> k_pattern(layer.k.slice(3, 0, 1).bytes(), 0x3c);
         CUDA_CHECK(cudaMemcpy(layer.k.slice(3, 0, 1).data, k_pattern.data(), k_pattern.size(),
                               cudaMemcpyHostToDevice));
+                              CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<unsigned char> v_pattern(layer.v.slice(3, 0, 1).bytes(), 0x4d);
         CUDA_CHECK(cudaMemcpy(layer.v.slice(3, 0, 1).data, v_pattern.data(), v_pattern.size(),
                               cudaMemcpyHostToDevice));
+                              CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<unsigned char> host(cyclic.lane_host_bytes());
         cyclic.copy_lane_to_host(0, host.data(), ctx.stream);
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));

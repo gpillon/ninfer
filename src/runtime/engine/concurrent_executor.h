@@ -1149,14 +1149,9 @@ private:
     // re-plans against the bumped KVRamCache index); a SourcePrefillBoundary decision returns
     // false since nothing was captured yet.
     bool maybe_capture_boundary(const std::shared_ptr<Request>& request) {
-        // Below this many shared tokens a capture's ~183 MiB fixed cost (GDN recurrent + conv +
-        // hyperquant side store, see kv_ram_cache.h) is not worth it regardless of consumer count;
-        // matches the previous maybe_capture_sibling_source threshold.
+        // Below this many shared tokens a capture is not worth its target-specific fixed state
+        // image regardless of consumer count; matches the previous sibling threshold.
         constexpr std::uint32_t kBoundaryMinimumFrontier = 2048;
-        constexpr std::uint64_t kBoundaryRecordFixedBytes = 183ULL * 1024 * 1024;
-        // hq-e8-2b target + MTP backend side store, ~9216 B/token (see plan doc derivation from
-        // qwen3_6_27b/impl/config.h and PagedKVCache row layout).
-        constexpr std::uint64_t kBoundaryRecordBytesPerToken = 9216;
 
         request->boundary_capture_frontier.reset();
         if (!request->options.execution.allow_prefix_reuse) { return false; }
@@ -1205,13 +1200,16 @@ private:
                                           : 0U,
                 });
             }
-            candidates.push_back(runtime::BoundaryCandidate{
-                .kind           = runtime::BoundaryCaptureKind::ActiveLaneCheckpoint,
-                .lane           = lane,
-                .frontier       = base,
-                .consumer_begin = consumer_begin,
-                .consumer_count = consumers.size() - consumer_begin,
-            });
+            if (const auto bytes = instance_.program->active_lane_sibling_capture_admission(lane)) {
+                candidates.push_back(runtime::BoundaryCandidate{
+                    .kind           = runtime::BoundaryCaptureKind::ActiveLaneCheckpoint,
+                    .lane           = lane,
+                    .frontier       = base,
+                    .capture_bytes  = *bytes,
+                    .consumer_begin = consumer_begin,
+                    .consumer_count = consumers.size() - consumer_begin,
+                });
+            }
         }
 
         // Family B: an LCP frontier partway through `request`'s own prefill that other pending
@@ -1222,6 +1220,27 @@ private:
             std::vector<std::uint32_t> distinct_lcps;
             const std::uint32_t source_prompt_tokens =
                 static_cast<std::uint32_t>(admitted_data.token_ids.size());
+            // RequestPlan::set_shared_capture_boundary drops any frontier at or below the winning
+            // plan's reuse_base: a prefill resuming there never recomputes that region, so it
+            // cannot snapshot it. The winner is not known yet, so take the highest reuse_base any
+            // plan still in the running could contribute, plus the request's own static
+            // system+tools frontier (which the Program already captures on its own). Proposing a
+            // lower frontier would cost the extra chunk split and then be dropped in silence.
+            std::uint32_t resumed_frontier =
+                admitted_data.identity.shared_prefix_frontier.value_or(0);
+            if (request->ram_plan) {
+                resumed_frontier = std::max(
+                    resumed_frontier, request->ram_plan->summary().reusable_prompt_tokens);
+            }
+            for (std::uint32_t plan_lane = 0; plan_lane < max_concurrency_; ++plan_lane) {
+                if (slots_[plan_lane] != nullptr || !request->lane_plans[plan_lane] ||
+                    request->lane_plan_versions[plan_lane] != lane_plan_versions_[plan_lane]) {
+                    continue;
+                }
+                resumed_frontier =
+                    std::max(resumed_frontier,
+                             request->lane_plans[plan_lane]->summary().reusable_prompt_tokens);
+            }
             for (const std::shared_ptr<Request>& other : queued) {
                 if (other->id == request->id) { continue; }
                 const targets::qwen3_6::PreparedPromptData& other_data =
@@ -1236,7 +1255,8 @@ private:
                                           : 0U,
                 });
                 if (const auto boundary = runtime::source_prefill_capture_frontier(
-                        common, source_prompt_tokens, kBoundaryMinimumFrontier)) {
+                        common, source_prompt_tokens, kBoundaryMinimumFrontier,
+                        resumed_frontier)) {
                     distinct_lcps.push_back(*boundary);
                 }
             }
@@ -1245,24 +1265,23 @@ private:
             distinct_lcps.erase(std::unique(distinct_lcps.begin(), distinct_lcps.end()),
                                distinct_lcps.end());
             for (std::uint32_t lcp : distinct_lcps) {
-                candidates.push_back(runtime::BoundaryCandidate{
-                    .kind           = runtime::BoundaryCaptureKind::SourcePrefillBoundary,
-                    .lane           = 0,
-                    .frontier       = lcp,
-                    .consumer_begin = consumer_begin,
-                    .consumer_count = consumer_count,
-                });
+                if (const auto bytes = instance_.program->shared_prefix_capture_admission(
+                        request->prompt, lcp)) {
+                    candidates.push_back(runtime::BoundaryCandidate{
+                        .kind           = runtime::BoundaryCaptureKind::SourcePrefillBoundary,
+                        .lane           = 0,
+                        .frontier       = lcp,
+                        .capture_bytes  = *bytes,
+                        .consumer_begin = consumer_begin,
+                        .consumer_count = consumer_count,
+                    });
+                }
             }
         }
 
         if (candidates.empty()) { return false; }
 
-        const auto ram = instance_.program->kv_ram_snapshot();
         const runtime::BoundaryCaptureBudget budget{
-            .record_fixed_bytes     = kBoundaryRecordFixedBytes,
-            .record_bytes_per_token = kBoundaryRecordBytesPerToken,
-            .ram_free_bytes = ram.capacity_bytes > ram.used_bytes ? ram.capacity_bytes - ram.used_bytes
-                                                                  : 0ULL,
             .minimum_frontier = kBoundaryMinimumFrontier,
         };
         const std::optional<runtime::BoundaryCandidate> chosen =

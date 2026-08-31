@@ -267,6 +267,19 @@ bool Program<Variant>::capture_retained_lane(std::uint32_t lane) {
 }
 
 template <>
+std::optional<std::uint64_t>
+Program<Variant>::active_lane_sibling_capture_admission(std::uint32_t lane) {
+    return impl_->active_lane_sibling_capture_admission(lane);
+}
+
+template <>
+std::optional<std::uint64_t>
+Program<Variant>::shared_prefix_capture_admission(const PreparedPrompt& prompt,
+                                                  std::uint32_t frontier) {
+    return impl_->shared_prefix_capture_admission(PreparedPromptAccess::view(prompt), frontier);
+}
+
+template <>
 bool Program<Variant>::capture_active_lane_for_siblings(std::uint32_t lane) {
     return impl_->capture_active_lane_for_siblings(lane);
 }

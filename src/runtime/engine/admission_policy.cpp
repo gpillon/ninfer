@@ -203,10 +203,7 @@ std::optional<BoundaryCandidate> choose_boundary_capture(
     for (const BoundaryCandidate& candidate : candidates) {
         if (candidate.kind == BoundaryCaptureKind::None) { continue; }
         if (candidate.frontier < budget.minimum_frontier) { continue; }
-        const std::uint64_t cost =
-            budget.record_fixed_bytes +
-            static_cast<std::uint64_t>(candidate.frontier) * budget.record_bytes_per_token;
-        if (cost > budget.ram_free_bytes) { continue; }
+        if (candidate.capture_bytes == 0) { continue; }
         if (candidate.consumer_begin > consumers.size() ||
             candidate.consumer_count > consumers.size() - candidate.consumer_begin) {
             continue;
@@ -220,7 +217,9 @@ std::optional<BoundaryCandidate> choose_boundary_capture(
         }
         if (score == 0) { continue; }
         if (best == nullptr || score > best_score ||
-            (score == best_score && candidate.frontier < best->frontier)) {
+            (score == best_score &&
+             (candidate.capture_bytes < best->capture_bytes ||
+              (candidate.capture_bytes == best->capture_bytes && candidate.frontier < best->frontier)))) {
             best       = &candidate;
             best_score = score;
         }
@@ -230,10 +229,13 @@ std::optional<BoundaryCandidate> choose_boundary_capture(
 
 std::optional<std::uint32_t>
 source_prefill_capture_frontier(std::uint32_t common_tokens, std::uint32_t source_prompt_tokens,
-                                std::uint32_t minimum_frontier) noexcept {
+                                std::uint32_t minimum_frontier,
+                                std::uint32_t resumed_frontier) noexcept {
     if (source_prompt_tokens < 2) { return std::nullopt; }
     const std::uint32_t frontier = std::min(common_tokens, source_prompt_tokens - 1U);
-    return frontier >= minimum_frontier ? std::optional<std::uint32_t>(frontier) : std::nullopt;
+    return frontier >= minimum_frontier && frontier > resumed_frontier
+               ? std::optional<std::uint32_t>(frontier)
+               : std::nullopt;
 }
 
 } // namespace ninfer::runtime

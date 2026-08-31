@@ -193,6 +193,12 @@ public:
     [[nodiscard]] RequestClass retained_owner_class(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
+    // Exact, target-owned preflight for admission-selected captures. nullopt means the capture
+    // cannot be made at this instant while preserving every existing RAM-cache record.
+    [[nodiscard]] std::optional<std::uint64_t>
+    active_lane_sibling_capture_admission(std::uint32_t lane);
+    [[nodiscard]] std::optional<std::uint64_t>
+    shared_prefix_capture_admission(const PreparedPrompt& prompt, std::uint32_t frontier);
     [[nodiscard]] bool capture_active_lane_for_siblings(std::uint32_t lane);
     [[nodiscard]] std::uint32_t active_lane_sibling_base(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::span<const TokenId> active_lane_tokens(std::uint32_t lane) const noexcept;

@@ -263,6 +263,11 @@ public:
     // host-RAM record is ever captured or matched in that configuration.
     [[nodiscard]] bool ram_tier_usable() const noexcept;
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
+    [[nodiscard]] std::optional<std::uint64_t>
+    active_lane_sibling_capture_admission(std::uint32_t lane);
+    [[nodiscard]] std::optional<std::uint64_t>
+    shared_prefix_capture_admission(const PreparedPromptData& prompt,
+                                    std::uint32_t frontier);
     // Speculative snapshot of a lane that has just finished prefill and is still actively
     // serving its own request (not retained/reclaimable) -- see kv_ram_cache.h's
     // RamCaptureSource::multi_claim. Returns false when the RAM tier is disabled or the lane has
@@ -435,6 +440,13 @@ private:
     // capture_active_lane_for_siblings(), which captures a still-active lane instead.
     [[nodiscard]] qwen3_6::detail::RamCaptureSource
     ram_capture_source_unchecked(const SequenceState& sequence);
+    [[nodiscard]] qwen3_6::detail::RamCaptureSource active_sibling_capture_source(
+        std::uint32_t lane, std::vector<TokenId>& ledger,
+        qwen3_6::detail::ResidentPrefixIdentity& identity) const;
+    [[nodiscard]] qwen3_6::detail::RamCaptureSource shared_boundary_capture_source(
+        const PreparedPromptData& prompt, std::uint32_t frontier, SequenceState* sequence,
+        qwen3_6::detail::ResidentPrefixIdentity& identity,
+        qwen3_6::detail::RamCaptureKind kind) const;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

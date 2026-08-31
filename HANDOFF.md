@@ -928,6 +928,103 @@ otherwise inspect terminal MTP host image/unpack.
 
 Feature documentation remains intentionally deferred per the user request.
 
+## Session addendum (2026-08-31): RAM admission/capture handover
+
+Checkpoint commit before this work: `2065ed38 perf(cache): capture dynamic shared-prefix boundaries`.
+The current worktree changes are intentionally **not committed**.
+
+Implemented in the current worktree:
+
+- `KVRamCache::capture_bytes()` is now the single exact sizing authority for a record. It accounts
+  for page images, GDN/residual/tail/DFlash side stores, headers, and alignment, using the actual
+  target pools/state rather than the fixed 27B HQ/MTP estimate.
+- `HostPinnedArena::can_alloc()` checks the real first-fit free-span geometry. RAM admission reaps
+  retired blocks, checks allocator fit, and accounts for the two-record `DynamicBoundary` cap.
+- Admission-selected active-sibling and dynamic-boundary captures use `PreserveExisting`; they
+  return a drop when the exact record cannot fit, without evicting an existing record. Ordinary
+  terminal captures keep `AllowEviction`.
+- The preflight and actual capture paths share the same `RamCaptureSource` builders, so they derive
+  the same pool/page/state layout. A dynamic boundary is rejected when it is not strictly beyond
+  an already existing static shared-prefix frontier.
+- Tests cover identical prompts, fragmented host-arena allocation, exact full-state footprint,
+  byte pressure, and the dynamic-boundary cap.
+
+Follow-up review (same session), and what it changed:
+
+- The dynamic-boundary guard keyed only on the prompt's static `shared_prefix_frontier`, but
+  `RequestPlan::set_shared_capture_boundary` rejects a frontier at or below the winning plan's
+  `reuse_base`. A boundary between those two values was still proposed and then dropped in
+  silence, after paying for the extra chunk split. `maybe_capture_boundary` now takes the highest
+  `reuse_base` any plan still in the running could contribute, and `source_prefill_capture_frontier`
+  rejects anything at or below it. Identical-prompt coverage was added for exactly that case.
+- `shared_boundary_capture_source()` had replaced `min(sequence.mtp_kv_valid, frontier)` and
+  `min(sequence.dflash_context_frontier, frontier)` with the active-sibling checkpoint formula.
+  Today `prepare_mtp` holds for every reuse path, so the record stayed honest, but the defence was
+  gone: a chunk that ever runs without `prepare_mtp` would produce a record claiming MTP KV it does
+  not have. The clamped form is restored for the real capture; preflight (no sequence) keeps the
+  nominal value, which cannot affect sizing because no header scalar feeds a section length.
+- The same builder had decoupled `backend_pool` (from `backend_kv_cache()`) from `backend` (from
+  the lane's own bundle), which would have turned a broken `reserve_sequence_kv` invariant into a
+  throw out of the prefill path via `capture()`'s XOR check. Both are gated together again.
+- The HQ residual-slot footprint regression test is now in `tests/test_kv_ram_cache.cpp`: it sizes
+  and captures the same source with and without the exact-key side store and requires the arena to
+  land on the quoted number.
+
+The KV-RAM gate is resolved, and the cause was in the test harness, not the RAM cache:
+
+- `DeviceBuffer::fill()` issues `cudaMemset` on the legacy default stream, and the tests seed
+  device memory with pageable `cudaMemcpy`, also on the default stream. `DeviceContext::stream` is
+  created with `cudaStreamNonBlocking`, so it does **not** implicitly synchronize with that stream.
+  Every seed/read pair across the two streams was racing; under GPU load (a running `ninfer-serve`)
+  the window widened and the failures became near-deterministic.
+- Adding a device sync at the seeding boundaries makes both suites green. Production is unaffected:
+  it drives capture and restore from one stream throughout.
+
+Verification completed (with `ninfer-serve` still holding the GPU at 100%):
+
+- `ninfer_admission_policy_test`, `ninfer_arena_test`, `ninfer_kv_cache_test`: pass.
+- `ninfer_kv_ram_cache_test`: pass, 3 consecutive runs (was failing every run).
+- `ninfer_kv_ram_cache_opt_test`: pass (was failing on tail-hidden round-trip, including on a
+  binary built before this work -- the baseline that proved the defect predates it).
+- `ninfer.exe` and `ninfer-serve.exe` link clean, so the production build carries these changes.
+- Whole built test suite on an idle GPU: all green except two pre-existing reds that this change
+  does not touch. `ninfer_qwen3_6_frontend_test` hardcodes a Linux tokenizer path. And
+  `ninfer_tool_call_parser_test` fails `test_suffix_after_tool_falls_back_to_text`: `5f014910`
+  moved `parse_qwen_tool_call_output` to graceful degradation (salvage every well-formed block,
+  keep trailing prose as content, mark the response as a tool call), while that test still asserts
+  the older all-or-nothing contract (a non-whitespace suffix falls back to verbatim text). The
+  contract, not the parser, needs a decision. `ninfer_qwen3_6_27b_load_plan_test` still fails to
+  link on a pre-existing cudart static/shared conflict.
+- `git diff --check`: clean. No commit or push was performed after `2065ed38`.
+
+Neither remaining red blocks the application. `ninfer_qwen3_6_frontend_test` cannot open a
+tokenizer at a path that only ever existed on the original author's Linux box, so it never reaches
+product code. `ninfer_tool_call_parser_test` runs product code, but the parser behaves as
+`5f014910` designed it and documents it in `tool_call_parser.cpp`; the test still encodes the
+contract that commit replaced. The server therefore behaves correctly today -- what is open is
+which of the two contracts is wanted, not whether the shipped one works. Both are test-side, and
+neither is in the admission path this session changed.
+
+Smoke test of the built application (2026-08-31, idle GPU, `models/qwen3_8_27b_nvfp4full.ninfer`):
+
+- `ninfer.exe`, greedy, `--kv-ram-capacity 2048`: loads 16.03 GiB of weights and answers exactly.
+- `ninfer-serve.exe`, `--max-concurrency 3 --kv-ram-capacity 4096`, three concurrent ~7000-token
+  prompts sharing a 6988-token prefix. All three answers correct. The third request reused 6988
+  tokens with `reuse=append_frontier reuse_source=host_ram` -- an admission-selected boundary
+  capture, restored from the host RAM tier -- while the cache reported `n=2 evicts=0 drops=0`, so
+  the `PreserveExisting` guarantee held under real concurrency.
+- A second identical round answered correctly again off `restore_turn_checkpoint`, with TTFT down
+  from 749-1667 ms to 40-87 ms. No error or warning in the whole server log.
+
+Recommended next steps for the next agent/session:
+
+1. Decide whether the default-stream seeding fix belongs in the tests (as done here) or in
+   `DeviceBuffer::fill()` itself; other suites likely carry the same latent race.
+2. Settle the tool-call suffix contract -- salvage (current parser) or all-or-nothing (current
+   test) -- and align the losing side.
+3. `ninfer_qwen3_6_27b_load_plan_test` still fails to link on a pre-existing cudart static/shared
+   conflict; that target has never produced a binary.
+
 ## Remaining work (in priority order)
 
 ### 0. 1M-context track (M1/M2 quality blocker CLEARED by WI-8, session 16)

@@ -109,35 +109,41 @@ struct BoundaryCandidate {
     BoundaryCaptureKind kind    = BoundaryCaptureKind::None;
     std::uint32_t lane          = 0;
     std::uint32_t frontier      = 0;
+    // Exact target-owned host-RAM footprint, including page rounding, side stores and layout
+    // alignment. A zero value marks a candidate that cannot be captured without eviction.
+    std::uint64_t capture_bytes = 0;
     std::size_t consumer_begin  = 0;
     std::size_t consumer_count  = 0;
 };
 
-// Fixed and per-token host-RAM cost of one capture, and the free budget it must fit inside without
-// forcing an eviction. `minimum_frontier` is the noise floor below which a capture is not worth its
-// fixed cost regardless of how many consumers share it.
+// `minimum_frontier` is the noise floor below which a capture is not worth its fixed cost
+// regardless of how many consumers share it. Per-candidate admission, including the exact record
+// size and the guarantee that no record would be evicted, belongs to the target Program.
 struct BoundaryCaptureBudget {
-    std::uint64_t record_fixed_bytes     = 0;
-    std::uint64_t record_bytes_per_token = 0;
-    std::uint64_t ram_free_bytes         = 0;
-    std::uint32_t minimum_frontier       = 2048;
+    std::uint32_t minimum_frontier = 2048;
 };
 
 // Selects at most one boundary to capture this admission event, maximizing aggregate tokens saved
 // across consumers rather than any single consumer's LCP: score(B) = sum over consumers whose
 // common_tokens >= B of max(0, B - already_reused). A shorter, cheaper boundary shared by many
 // consumers can outscore a longer one that only helps its single best match. Ties prefer the
-// smaller (cheaper) frontier. Candidates below minimum_frontier or whose fixed+variable cost would
-// not fit ram_free_bytes are rejected outright, never forcing an eviction for a speculative
-// capture. Returns nullopt if no candidate has positive score.
+// smaller exact footprint, then the smaller frontier. Candidates below minimum_frontier or without a target-approved
+// non-evicting capture footprint are rejected outright. Returns nullopt if no candidate has
+// positive score.
 [[nodiscard]] std::optional<BoundaryCandidate> choose_boundary_capture(
     std::span<const BoundaryCandidate> candidates, std::span<const BoundaryConsumer> consumers,
     const BoundaryCaptureBudget& budget) noexcept;
 
 // Converts a source/consumer LCP into the latest boundary the source request can actually
-// capture. A prefill boundary must remain strictly before the source prompt's final token.
+// capture. A prefill boundary must remain strictly before the source prompt's final token, and
+// strictly beyond `resumed_frontier` -- the highest prefix the source will not recompute this
+// admission (its static system+tools boundary, or a plan's reuse_base). A boundary at or below it
+// is silently dropped by the target's set_shared_capture_boundary, so it must never be proposed:
+// only a prefill that actually computes the region can snapshot it. Identical prompts land here,
+// where the LCP reaches the whole prompt but the reusable prefix already covers it.
 [[nodiscard]] std::optional<std::uint32_t>
 source_prefill_capture_frontier(std::uint32_t common_tokens, std::uint32_t source_prompt_tokens,
-                                std::uint32_t minimum_frontier) noexcept;
+                                std::uint32_t minimum_frontier,
+                                std::uint32_t resumed_frontier = 0) noexcept;
 
 } // namespace ninfer::runtime

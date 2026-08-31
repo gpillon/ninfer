@@ -1067,6 +1067,145 @@ bool ProgramImplCore::capture_retained_lane(std::uint32_t lane) {
     return kv_ram_cache_->capture(ram_capture_source(sequences[lane]));
 }
 
+qwen3_6::detail::RamCaptureSource ProgramImplCore::active_sibling_capture_source(
+    std::uint32_t lane, std::vector<TokenId>& ledger,
+    qwen3_6::detail::ResidentPrefixIdentity& identity) const {
+    const SequenceState& sequence = sequences[lane];
+    const std::uint32_t frontier  = sequence.rewrite_checkpoint.frontier;
+    ledger.assign(sequence.ledger.begin(),
+                  sequence.ledger.begin() + static_cast<std::ptrdiff_t>(frontier) + 1);
+    identity = sequence.prefix_identity;
+    identity.truncate(ledger.size());
+
+    qwen3_6::detail::RamCaptureSource source;
+    source.execution_frontier      = frontier;
+    source.ledger_frontier         = frontier + 1;
+    source.rope_delta              = sequence.rope_delta;
+    source.text_kv_valid           = frontier;
+    source.mtp_kv_valid            = speculative_backend == SpeculativeBackend::Mtp ? frontier - 1 : 0;
+    source.dflash_context_frontier = speculative_backend == SpeculativeBackend::DFlash ? frontier : 0;
+    source.tail_hidden_valid       = true;
+    source.ledger                  = ledger;
+    source.identity                = &identity;
+    source.hash_f                  = qwen3_6::detail::prefix_hash_at(ledger, identity, frontier);
+    source.text                    = &sequence.kv->text;
+    source.text_pool               = &decoder->text_kv.pool();
+    source.text_pages              = ninfer::pages_for_tokens(frontier);
+    source.text_cache              = &decoder->text_kv;
+    if (sequence.kv->backend) {
+        source.backend       = &*sequence.kv->backend;
+        source.backend_pool  = &backend_kv_cache()->pool();
+        source.backend_pages = ninfer::pages_for_tokens(
+            speculative_backend == SpeculativeBackend::Mtp ? frontier - 1 : frontier);
+        source.backend_cache = backend_kv_cache();
+    }
+    source.residual_row     = static_cast<std::int32_t>(sequence.lane);
+    source.gdn              = &decoder->linear_attention;
+    source.gdn_current_slot = LinearStateSlots::rewrite_checkpoint_state_slot(
+        sequence.lane, max_concurrency);
+    source.tail_hidden  = &sequence.rewrite_checkpoint_hidden;
+    source.dflash_local = dflash ? &dflash->rewrite_checkpoint_local : nullptr;
+    source.dflash_lane  = static_cast<std::int32_t>(sequence.lane);
+    source.stream       = device.stream;
+    source.multi_claim  = true;
+    source.owner_class  = sequence.owner_class;
+    source.capture_kind = qwen3_6::detail::RamCaptureKind::ActiveSibling;
+    return source;
+}
+
+qwen3_6::detail::RamCaptureSource ProgramImplCore::shared_boundary_capture_source(
+    const PreparedPromptData& prompt, std::uint32_t frontier, SequenceState* sequence,
+    qwen3_6::detail::ResidentPrefixIdentity& identity,
+    qwen3_6::detail::RamCaptureKind kind) const {
+    const std::uint32_t ledger_frontier = frontier + 1;
+    identity.assign(prompt);
+    identity.truncate(ledger_frontier);
+
+    qwen3_6::detail::RamCaptureSource source;
+    source.execution_frontier      = frontier;
+    source.ledger_frontier         = ledger_frontier;
+    source.rope_delta              = sequence != nullptr ? sequence->rope_delta : prompt.rope_delta;
+    source.text_kv_valid           = frontier;
+    // Preflight (no sequence) sizes the record only, and no header scalar feeds a section length,
+    // so the admission estimate is unaffected by these. The real capture must keep reporting what
+    // the lane actually holds: a chunk that ran without prepare_mtp leaves mtp_kv_valid behind the
+    // frontier, and a record claiming otherwise would let a later restore read unwritten MTP KV.
+    source.mtp_kv_valid = speculative_backend == SpeculativeBackend::Mtp
+                              ? (sequence != nullptr ? std::min(sequence->mtp_kv_valid, frontier)
+                                                     : frontier - 1)
+                              : 0;
+    source.dflash_context_frontier =
+        speculative_backend == SpeculativeBackend::DFlash
+            ? (sequence != nullptr ? std::min(sequence->dflash_context_frontier, frontier)
+                                   : frontier)
+            : 0;
+    source.tail_hidden_valid       = true;
+    source.ledger                  = std::span<const TokenId>(prompt.token_ids).first(ledger_frontier);
+    source.identity                = &identity;
+    source.hash_f = qwen3_6::detail::prefix_hash_at(source.ledger, identity, frontier);
+    source.text_pool  = &decoder->text_kv.pool();
+    source.text_pages = ninfer::pages_for_tokens(frontier);
+    source.text_cache = &decoder->text_kv;
+    // reserve_sequence_kv gives a lane a backend allocation exactly when the target has a backend
+    // KV cache, so preflight and capture agree on the section geometry. Keeping the pool gated on
+    // the sequence's own bundle also keeps capture()'s backend/backend_pool XOR check unreachable
+    // rather than turning a broken invariant into a throw out of the prefill path.
+    const bool has_backend = sequence != nullptr ? sequence->kv->backend.has_value()
+                                                 : backend_kv_cache() != nullptr;
+    if (const qwen3_6::PagedKVCache* backend = has_backend ? backend_kv_cache() : nullptr) {
+        source.backend_pool  = &backend->pool();
+        source.backend_pages = ninfer::pages_for_tokens(
+            speculative_backend == SpeculativeBackend::Mtp ? frontier - 1 : frontier);
+        source.backend_cache = backend;
+    }
+    source.residual_row = sequence != nullptr ? static_cast<std::int32_t>(sequence->lane) : 0;
+    source.gdn          = &decoder->linear_attention;
+    source.tail_hidden  = sequence != nullptr ? &sequence->tail_hidden : &sequences[0].tail_hidden;
+    source.dflash_local = dflash ? &dflash->local : nullptr;
+    source.capture_kind = kind;
+    source.multi_claim  = true;
+    if (sequence != nullptr) {
+        source.text = &sequence->kv->text;
+        if (has_backend) { source.backend = &*sequence->kv->backend; }
+        source.gdn_current_slot =
+            LinearStateSlots::current_state_slot(sequence->lane, max_concurrency);
+        source.dflash_lane = static_cast<std::int32_t>(sequence->lane);
+        source.stream      = device.stream;
+        source.owner_class = sequence->owner_class;
+    }
+    return source;
+}
+
+std::optional<std::uint64_t>
+ProgramImplCore::active_lane_sibling_capture_admission(std::uint32_t lane) {
+    if (!kv_ram_cache_ || active_lane_sibling_base(lane) == 0) { return std::nullopt; }
+    std::vector<TokenId> ledger;
+    qwen3_6::detail::ResidentPrefixIdentity identity;
+    const qwen3_6::detail::RamCaptureSource source =
+        active_sibling_capture_source(lane, ledger, identity);
+    if (!kv_ram_cache_->can_capture_without_eviction(source)) { return std::nullopt; }
+    return static_cast<std::uint64_t>(kv_ram_cache_->capture_bytes(source));
+}
+
+std::optional<std::uint64_t>
+ProgramImplCore::shared_prefix_capture_admission(const PreparedPromptData& prompt,
+                                                 std::uint32_t frontier) {
+    if (!kv_ram_cache_ || prompt.has_media() || frontier == 0 || frontier >= prompt.token_ids.size()) {
+        return std::nullopt;
+    }
+    if (prompt.identity.shared_prefix_frontier &&
+        frontier <= *prompt.identity.shared_prefix_frontier) {
+        return std::nullopt;
+    }
+    qwen3_6::detail::ResidentPrefixIdentity identity;
+    const std::uint32_t ledger_frontier = frontier + 1;
+    const qwen3_6::detail::RamCaptureSource source = shared_boundary_capture_source(
+        prompt, frontier, nullptr, identity, qwen3_6::detail::RamCaptureKind::DynamicBoundary);
+    if (identity.size() != ledger_frontier) { return std::nullopt; }
+    if (!kv_ram_cache_->can_capture_without_eviction(source)) { return std::nullopt; }
+    return static_cast<std::uint64_t>(kv_ram_cache_->capture_bytes(source));
+}
+
 void ProgramImplCore::capture_shared_prefix_boundary(SequenceState& sequence,
                                                      const PreparedPromptData& prompt,
                                                      std::uint32_t frontier,
@@ -1083,55 +1222,15 @@ void ProgramImplCore::capture_shared_prefix_boundary(SequenceState& sequence,
     // carries one more, mirroring the settled-lane convention; that trailing token is this
     // request's own first divergent token and is only ever read for matching, never for
     // continuation -- start_prefill_lane replaces the ledger with the resuming prompt's tokens.
-    std::vector<TokenId> ledger(
-        prompt.token_ids.begin(),
-        prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(frontier) + 1);
     qwen3_6::detail::ResidentPrefixIdentity identity;
-    identity.assign(prompt);
-    identity.truncate(ledger.size());
-    if (identity.size() != ledger.size()) { return; }
-
-    qwen3_6::detail::RamCaptureSource source;
-    source.execution_frontier = frontier;
-    source.ledger_frontier    = static_cast<std::uint32_t>(ledger.size());
-    source.rope_delta         = sequence.rope_delta;
-    source.text_kv_valid      = frontier;
-    source.mtp_kv_valid       = std::min(sequence.mtp_kv_valid, frontier);
-    source.dflash_context_frontier = std::min(sequence.dflash_context_frontier, frontier);
-    source.tail_hidden_valid       = true;
-    source.rewrite_valid           = false;
-    source.ledger                  = ledger;
-    source.identity                = &identity;
-    source.hash_f = qwen3_6::detail::prefix_hash_at(ledger, identity, frontier);
-    source.text       = &sequence.kv->text;
-    source.text_pool  = &decoder->text_kv.pool();
-    source.text_pages = ninfer::pages_for_tokens(frontier);
-    source.text_cache = &decoder->text_kv;
-    if (sequence.kv->backend) {
-        source.backend       = &*sequence.kv->backend;
-        source.backend_pool  = &backend_kv_cache()->pool();
-        source.backend_pages = ninfer::pages_for_tokens(
-            speculative_backend == SpeculativeBackend::Mtp ? frontier - 1 : frontier);
-        source.backend_cache = backend_kv_cache();
-    }
-    // Same row convention as ram_capture_source: bind_sequence_kv binds a lane to its own index.
-    // Here the lane is still bound (this captures mid-prefill), so the allocation would report the
-    // row too, but naming the lane keeps both capture paths reading identically.
-    source.residual_row = static_cast<std::int32_t>(sequence.lane);
-    source.gdn = &decoder->linear_attention;
-    source.gdn_current_slot =
-        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
-    source.gdn_checkpoint_slot = -1;
-    source.tail_hidden         = &sequence.tail_hidden;
-    if (dflash) {
-        source.dflash_local = &dflash->local;
-        source.dflash_lane  = static_cast<std::int32_t>(sequence.lane);
-    }
-    source.stream       = device.stream;
-    source.multi_claim  = true;
-    source.owner_class  = sequence.owner_class;
-    source.capture_kind = kind;
-    (void)kv_ram_cache_->capture(source);
+    const qwen3_6::detail::RamCaptureSource source =
+        shared_boundary_capture_source(prompt, frontier, &sequence, identity, kind);
+    if (identity.size() != source.ledger.size()) { return; }
+    const qwen3_6::detail::RamCapturePolicy policy =
+        kind == qwen3_6::detail::RamCaptureKind::DynamicBoundary
+            ? qwen3_6::detail::RamCapturePolicy::PreserveExisting
+            : qwen3_6::detail::RamCapturePolicy::AllowEviction;
+    (void)kv_ram_cache_->capture(source, policy);
 }
 
 bool ProgramImplCore::capture_active_lane_for_siblings(std::uint32_t lane) {
@@ -1141,57 +1240,11 @@ bool ProgramImplCore::capture_active_lane_for_siblings(std::uint32_t lane) {
     // lane as busy, not reclaimable -- only the prompt-region KV/GDN/tail-hidden state this reads
     // is snapshotted; nothing about the live lane is touched or torn down.
     if (active_lane_sibling_base(lane) == 0) { return false; }
-    const SequenceState& sequence = sequences[lane];
-    const std::uint32_t frontier  = sequence.rewrite_checkpoint.frontier;
-
-    // This record is the checkpoint itself, not a current-decode record that merely advertises
-    // an older fallback. Keeping the generated tail would serialize unusable pages and state.
-    std::vector<TokenId> ledger(sequence.ledger.begin(),
-                                sequence.ledger.begin() +
-                                    static_cast<std::ptrdiff_t>(frontier) + 1);
-    qwen3_6::detail::ResidentPrefixIdentity identity = sequence.prefix_identity;
-    identity.truncate(ledger.size());
-
-    qwen3_6::detail::RamCaptureSource source;
-    source.execution_frontier      = frontier;
-    source.ledger_frontier         = frontier + 1;
-    source.rope_delta              = sequence.rope_delta;
-    source.text_kv_valid           = frontier;
-    source.mtp_kv_valid            = speculative_backend == SpeculativeBackend::Mtp
-                                         ? frontier - 1
-                                         : 0;
-    source.dflash_context_frontier = speculative_backend == SpeculativeBackend::DFlash
-                                         ? frontier
-                                         : 0;
-    source.tail_hidden_valid       = true;
-    source.ledger                  = ledger;
-    source.identity                = &identity;
-    source.hash_f = qwen3_6::detail::prefix_hash_at(ledger, identity, frontier);
-    source.text       = &sequence.kv->text;
-    source.text_pool  = &decoder->text_kv.pool();
-    source.text_pages = ninfer::pages_for_tokens(frontier);
-    source.text_cache = &decoder->text_kv;
-    if (sequence.kv->backend) {
-        source.backend       = &*sequence.kv->backend;
-        source.backend_pool  = &backend_kv_cache()->pool();
-        source.backend_pages = ninfer::pages_for_tokens(
-            speculative_backend == SpeculativeBackend::Mtp ? frontier - 1 : frontier);
-        source.backend_cache = backend_kv_cache();
-    }
-    source.residual_row       = static_cast<std::int32_t>(sequence.lane);
-    source.gdn                = &decoder->linear_attention;
-    source.gdn_current_slot   = LinearStateSlots::rewrite_checkpoint_state_slot(
-        sequence.lane, max_concurrency);
-    source.tail_hidden        = &sequence.rewrite_checkpoint_hidden;
-    if (dflash) {
-        source.dflash_local = &dflash->rewrite_checkpoint_local;
-        source.dflash_lane  = static_cast<std::int32_t>(sequence.lane);
-    }
-    source.stream       = device.stream;
-    source.multi_claim  = true;
-    source.owner_class  = sequence.owner_class;
-    source.capture_kind = qwen3_6::detail::RamCaptureKind::ActiveSibling;
-    return kv_ram_cache_->capture(source);
+    std::vector<TokenId> ledger;
+    qwen3_6::detail::ResidentPrefixIdentity identity;
+    const qwen3_6::detail::RamCaptureSource source =
+        active_sibling_capture_source(lane, ledger, identity);
+    return kv_ram_cache_->capture(source, qwen3_6::detail::RamCapturePolicy::PreserveExisting);
 }
 
 std::uint32_t ProgramImplCore::active_lane_sibling_base(std::uint32_t lane) const noexcept {

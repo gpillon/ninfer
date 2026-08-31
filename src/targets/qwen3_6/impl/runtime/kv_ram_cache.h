@@ -35,6 +35,13 @@ enum class RamCaptureKind : std::uint8_t {
     DynamicBoundary,
 };
 
+// Admission-selected captures must preserve all existing records. Terminal retention can retain
+// the normal cache policy, which is allowed to reclaim cold unclaimed records for progress.
+enum class RamCapturePolicy : std::uint8_t {
+    AllowEviction,
+    PreserveExisting,
+};
+
 struct RamCaptureSource {
     std::uint32_t execution_frontier      = 0;
     std::uint32_t ledger_frontier         = 0;
@@ -163,7 +170,14 @@ public:
     void release(std::uint64_t entry_id);
     void consume(std::uint64_t entry_id);
 
-    bool capture(const RamCaptureSource& source);
+    // Exact record footprint produced by capture(source), including every serialized section and
+    // alignment. This is the single sizing authority used by target admission preflight.
+    [[nodiscard]] std::size_t capture_bytes(const RamCaptureSource& source) const;
+    // True only when this source can be captured now without reclaiming a record, including the
+    // DynamicBoundary live-count policy. The actual PreserveExisting capture repeats the check.
+    [[nodiscard]] bool can_capture_without_eviction(const RamCaptureSource& source);
+    bool capture(const RamCaptureSource& source,
+                 RamCapturePolicy policy = RamCapturePolicy::AllowEviction);
     RamRestoredHost unpack_device(std::uint64_t entry_id, const RamRestoreTarget& target);
 
     [[nodiscard]] RamRestoredHost load_host(std::uint64_t entry_id) const;
@@ -258,6 +272,7 @@ private:
     // when the cap is met and every existing DynamicBoundary record is claimed -- the caller must
     // then fail the capture rather than force an eviction of state still in use.
     bool make_room_for_dynamic_boundary();
+    [[nodiscard]] bool has_room_for_dynamic_boundary_without_eviction() const noexcept;
     void begin_copies(Record& record, cudaStream_t stream);
     void record_copies(Record& record, cudaStream_t stream);
     void wait_copies(Record& record);

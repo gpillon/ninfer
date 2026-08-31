@@ -188,12 +188,7 @@ int main() {
     using ninfer::runtime::choose_boundary_capture;
     using ninfer::runtime::source_prefill_capture_frontier;
 
-    const BoundaryCaptureBudget generous_budget{
-        .record_fixed_bytes     = 183ULL * 1024 * 1024,
-        .record_bytes_per_token = 9216,
-        .ram_free_bytes         = 8ULL * 1024 * 1024 * 1024,
-        .minimum_frontier       = 2048,
-    };
+    const BoundaryCaptureBudget generous_budget{.minimum_frontier = 2048};
 
     {
         const auto identical = source_prefill_capture_frontier(8192, 8192, 2048);
@@ -204,6 +199,20 @@ int main() {
                           "shorter shared prefix changed the valid capture frontier");
         failures += check(!source_prefill_capture_frontier(1, 1, 1).has_value(),
                           "single-token prompt produced an impossible capture boundary");
+        failures += check(!source_prefill_capture_frontier(4096, 8192, 2048, 6000).has_value(),
+                          "dynamic boundary below an existing static capture was selected");
+        // Identical prompts: the LCP reaches the whole prompt, so the candidate lands one token
+        // short of the end. That is a real boundary only while the source still has to compute
+        // the region. Once the source itself resumes at or past it -- an exact RAM/VRAM prefix
+        // match, or its own static system+tools frontier -- the target drops the boundary in
+        // silence, and admission must not spend a chunk split proposing it.
+        failures += check(!source_prefill_capture_frontier(8192, 8192, 2048, 8191).has_value(),
+                          "identical prompts proposed a boundary the source never recomputes");
+        failures += check(!source_prefill_capture_frontier(8192, 8192, 2048, 8192).has_value(),
+                          "a fully reused identical prompt still proposed a capture boundary");
+        const auto partial_reuse = source_prefill_capture_frontier(8192, 8192, 2048, 4096);
+        failures += check(partial_reuse.has_value() && *partial_reuse == 8191,
+                          "identical prompts lost a boundary still inside the recomputed suffix");
     }
 
     {
@@ -220,10 +229,12 @@ int main() {
         std::array<BoundaryCandidate, 2> candidates{
             BoundaryCandidate{.kind               = BoundaryCaptureKind::SourcePrefillBoundary,
                               .frontier           = 20000,
+                              .capture_bytes      = 320ULL << 20,
                               .consumer_begin     = 0,
                               .consumer_count     = consumers.size()},
             BoundaryCandidate{.kind               = BoundaryCaptureKind::SourcePrefillBoundary,
                               .frontier           = 11000,
+                              .capture_bytes      = 240ULL << 20,
                               .consumer_begin     = 0,
                               .consumer_count     = consumers.size()},
         };
@@ -240,6 +251,7 @@ int main() {
         std::array<BoundaryCandidate, 1> candidates{
             BoundaryCandidate{.kind           = BoundaryCaptureKind::SourcePrefillBoundary,
                               .frontier       = 5000,
+                              .capture_bytes  = 220ULL << 20,
                               .consumer_begin = 0,
                               .consumer_count = consumers.size()},
         };
@@ -249,22 +261,21 @@ int main() {
     }
 
     {
-        // Insufficient RAM budget rejects an otherwise-scoring candidate rather than forcing
-        // an eviction for a speculative capture.
+        // A target preflight that cannot preserve existing records marks the candidate with no
+        // footprint, and policy must reject it regardless of its score.
         std::array<BoundaryConsumer, 1> consumers{
             BoundaryConsumer{.common_tokens = 11000, .already_reused = 0},
         };
         std::array<BoundaryCandidate, 1> candidates{
             BoundaryCandidate{.kind           = BoundaryCaptureKind::SourcePrefillBoundary,
                               .frontier       = 11000,
+                              .capture_bytes  = 0,
                               .consumer_begin = 0,
                               .consumer_count = consumers.size()},
         };
-        BoundaryCaptureBudget tight_budget = generous_budget;
-        tight_budget.ram_free_bytes        = 10ULL * 1024 * 1024;
         failures += check(
-            !choose_boundary_capture(candidates, consumers, tight_budget).has_value(),
-            "a capture whose fixed+variable cost exceeds free RAM should be rejected");
+            !choose_boundary_capture(candidates, consumers, generous_budget).has_value(),
+            "a capture requiring eviction should be rejected by admission");
     }
 
     {
@@ -275,6 +286,7 @@ int main() {
         std::array<BoundaryCandidate, 1> candidates{
             BoundaryCandidate{.kind           = BoundaryCaptureKind::SourcePrefillBoundary,
                               .frontier       = 1000,
+                              .capture_bytes  = 220ULL << 20,
                               .consumer_begin = 0,
                               .consumer_count = consumers.size()},
         };
@@ -284,7 +296,7 @@ int main() {
     }
 
     {
-        // Equal aggregate score (12000 each) prefers the cheaper (smaller) frontier.
+        // Equal aggregate score (12000 each) prefers the smaller exact capture footprint.
         std::array<BoundaryConsumer, 3> consumers{
             BoundaryConsumer{.common_tokens = 6000, .already_reused = 0},
             BoundaryConsumer{.common_tokens = 6000, .already_reused = 0},
@@ -293,17 +305,19 @@ int main() {
         std::array<BoundaryCandidate, 2> candidates{
             BoundaryCandidate{.kind           = BoundaryCaptureKind::SourcePrefillBoundary,
                               .frontier       = 6000,
+                              .capture_bytes  = 240ULL << 20,
                               .consumer_begin = 0,
                               .consumer_count = 2},
             BoundaryCandidate{.kind           = BoundaryCaptureKind::ActiveLaneCheckpoint,
                               .lane           = 2,
                               .frontier       = 12000,
+                              .capture_bytes  = 320ULL << 20,
                               .consumer_begin = 2,
                               .consumer_count = 1},
         };
         const auto chosen = choose_boundary_capture(candidates, consumers, generous_budget);
-        failures +=
-            check(chosen.has_value() && chosen->frontier == 6000, "tie-break lost the smaller frontier");
+        failures += check(chosen.has_value() && chosen->frontier == 6000,
+                          "tie-break lost the smaller exact capture footprint");
     }
 
     if (failures == 0) { std::cout << "ok\n"; }

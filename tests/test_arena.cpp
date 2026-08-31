@@ -236,12 +236,20 @@ int main() {
         } else {
             host.free(b);
             failures += expect_size(host.used(), 512, "host used with middle hole");
+            if (host.can_alloc(384, 256)) {
+                ++failures;
+                std::cerr << "host preflight ignored first-fit fragmentation\n";
+            }
             if (host.try_alloc(384, 256) != nullptr) {
                 ++failures;
                 std::cerr << "first-fit allocated across a pinned middle hole\n";
             }
             host.free(a);
             host.free(c);
+            if (!host.can_alloc(768, 256)) {
+                ++failures;
+                std::cerr << "host preflight missed a coalesced allocation\n";
+            }
             if (host.try_alloc(768, 256) == nullptr) {
                 ++failures;
                 std::cerr << "coalesced host arena failed to absorb the middle hole\n";

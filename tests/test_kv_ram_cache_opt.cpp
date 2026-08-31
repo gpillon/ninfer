@@ -317,6 +317,7 @@ int main() {
     }
     ninfer::DeviceBuffer hidden_buf(256);
     hidden_buf.fill(0x5a);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {256});
     fill_logical_pages(pool, contiguous, 24);
     ninfer::targets::qwen3_6::detail::KVRamCache gdn_cache(8ULL << 20);
@@ -330,6 +331,7 @@ int main() {
     if (!gdn_match) { return fail("GDN capture did not match"); }
     ninfer::DeviceBuffer hidden_out_buf(256);
     hidden_out_buf.fill(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {256});
     ninfer::targets::qwen3_6::detail::RamRestoreTarget gdn_target;
     gdn_target.text             = &gdn_dest;
