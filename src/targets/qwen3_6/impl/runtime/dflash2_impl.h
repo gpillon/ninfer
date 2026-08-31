@@ -24,12 +24,18 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
+
+// Widest block the NVFP4 A16 linear_swiglu route is registered for; its small-T launcher table
+// in nvfp4_linear_swiglu_plan.cpp ends at 16.
+inline constexpr std::int32_t kDFlash2SwiGluColumnLimit = 16;
+
 
 void require_dflash2_state(const PrefillContext& state) {
     if (state.dflash2 == nullptr || !state.execution.model.dflash2.has_value()) {
@@ -264,9 +270,20 @@ void dflash2_propose_batch_impl(DFlash2BatchContext& state, qwen3_6::DFlashDecod
                             state.execution.device.stream);
                 ops::dflash2_dynamic_conv(roots.hidden, roots.dynamic, weight.mlp_conv_base, 0,
                                           width, roots.conv_hidden, state.execution.device.stream);
-                ops::linear_swiglu(roots.conv_hidden, weight.gate_up, roots.intermediate,
-                                   ops::LinearPolicy::A16Only, state.execution.work,
-                                   state.execution.device.stream);
+                // The NVFP4 A16 swiglu route is instantiated through T=16 only, and the
+                // drafter's block forward carries width * batch columns -- 32 at the four-lane
+                // envelope this tree serves. The op is per-column, so a wide block is split
+                // into registered slices rather than widening the kernel table.
+                for (std::int32_t begin = 0; begin < columns;
+                     begin += kDFlash2SwiGluColumnLimit) {
+                    const std::int32_t span =
+                        std::min(kDFlash2SwiGluColumnLimit, columns - begin);
+                    Tensor gate_up_in  = roots.conv_hidden.slice(1, begin, span);
+                    Tensor gate_up_out = roots.intermediate.slice(1, begin, span);
+                    ops::linear_swiglu(gate_up_in, weight.gate_up, gate_up_out,
+                                       ops::LinearPolicy::A16Only, state.execution.work,
+                                       state.execution.device.stream);
+                }
                 ops::linear(roots.intermediate, weight.down, roots.projected,
                             state.execution.device.stream);
                 ops::dflash2_dynamic_conv(roots.projected, roots.dynamic, weight.mlp_conv_base, 1,

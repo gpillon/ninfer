@@ -264,7 +264,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             throw std::logic_error("ReplaySSM records do not match the MTP width policy");
         }
     }
-    if (replay_records.has_value() != (speculative_backend == SpeculativeBackend::DFlash)) {
+    if (replay_records.has_value() != (speculative_backend == SpeculativeBackend::DFlash ||
+                                       speculative_backend == SpeculativeBackend::DFlash2)) {
         throw std::logic_error("ReplaySSM records do not match the speculative backend");
     }
     if (plan.persistent.dflash) { dflash.emplace(backing, *plan.persistent.dflash); }

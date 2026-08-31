@@ -889,9 +889,26 @@ tokens per question.
 ## 15. Fork artifact: the DFlash2 drafter module
 
 The `nvfp4full` artifact additionally carries the DFlash2 block-diffusion drafter as part of its
-one complete image (the conversion recipe `qwen3_8_27b_nvfp4full-v1` takes a fourth source,
-`--dflash2-model`, pointing at the incoai/z-lab 2B BF16 drafter checkpoint). The module does not
-define a second artifact or an optional profile; module-less `nvfp4full` files are superseded.
+one complete image (the conversion recipe `qwen3_8_27b_nvfp4full-v2` takes a fourth source,
+`--dflash2-model`, pointing at the incoai/z-lab 2B BF16 drafter checkpoint:
+`incoai/Qwen3.8-27B-DFlash2`, revision `dedf8df68adfb1afeaf7b7480c0a0243108177b4`, mirrored at
+`z-lab/Qwen3.8-27B-DFlash2` -- 3.85 GiB BF16, a single `model.safetensors`). The module does not
+define a second artifact or an optional profile; module-less `nvfp4full` files are superseded, and
+the loader refuses them outright, since it requires every artifact object to be consumed.
+
+An already-converted module-less image does not have to be rebuilt to gain the module. v2 is
+exactly v1 plus the module's 66 objects, appended after the Vision merger objects, so every
+pre-existing object keeps its position, layout and payload-relative offset:
+
+    python3 -m tools.artifact.graft_dflash2_module \
+      --artifact models/qwen3_8_27b_nvfp4full.ninfer \
+      --dflash2-model /path/to/Qwen3.8-27B-DFlash2 \
+      --out models/qwen3_8_27b_nvfp4full-v2.ninfer
+
+The graft encodes the module through the converter's own
+`materialize_dflash2_object`, so it cannot drift from the full recipe, and it refuses any input
+that is not the module-less image of this same recipe. It needs only the drafter checkpoint --
+not the base and quantized 27B sources -- and runs on a CPU-only torch build (`--device cpu`).
 
 ### 15.1 Fixed module facts
 
@@ -940,5 +957,7 @@ checkpoint's `config.json` against the registered facts above before reading any
 The binder enumerates every module object unconditionally for the `qwen3.8-27b/nvfp4full`
 identity (validation-only placement until the DFlash2 startup feature selects device
 materialization, exactly like the Vision and proposal-head placement rules). Execution
-(`--spec dflash2 --draft-tokens N`, N in 1..7) is enabled by the draft-kernel work items; the
-engine rejects it with an explicit single-seam error until then.
+(`--spec dflash2 --draft-tokens N`, N in 1..7) is enabled: the draft kernels, the device-side
+top-k and selector walk, and the captured decode graphs all landed with the port. Two option
+combinations stay rejected -- `--lm-head-draft`, because DFlash2's candidates span the whole
+vocabulary and it requires the full proposal head, and `--adaptive-mtp`, which is MTP-only.

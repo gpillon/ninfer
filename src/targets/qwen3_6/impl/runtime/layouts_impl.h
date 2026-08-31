@@ -150,7 +150,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .value_dim       = TextConfig::gdn_value_head_dim,
                          });
         }
-    } else if (plan.speculative_backend == SpeculativeBackend::DFlash) {
+    } else if (plan.speculative_backend == SpeculativeBackend::DFlash ||
+               plan.speculative_backend == SpeculativeBackend::DFlash2) {
+        // Both DFlash backends verify one fixed block per round, so a single record set at
+        // draft_window + 1 covers them; only adaptive MTP needs the per-width array above.
         out.replay_records = plan_gdn_replay_records(
             builder, GdnReplayRecordSpec{
                          .layers          = TextConfig::gdn_layers(),
