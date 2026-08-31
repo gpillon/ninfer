@@ -16,6 +16,11 @@ set "SERVER=%ROOT%build-ninja\apps\ninfer-serve.exe"
 rem The module is part of the nvfp4full identity's complete image, so the engine requires the
 rem dflash2/* objects under this profile whatever --spec says: only the v2 artifact loads.
 set "WEIGHTS=%ROOT%models\qwen3_8_27b_nvfp4full-v2.ninfer"
+rem Full-precision per-request records, including the drafter's per-slot acceptance profile.
+rem Override by setting NINFER_JSONL before calling; the path is anchored to this script, not to
+rem whatever directory the server happens to be started from.
+if not defined NINFER_JSONL set "NINFER_JSONL=%ROOT%..	races-dflash2.jsonl"
+set "JSONL=%NINFER_JSONL%"
 
 if not exist "%SERVER%" (
     echo [qwen3.8-27b-nvfp4full-dflash2-262k] missing %SERVER% - run configure-ninja.ps1 then build-ninja.ps1 first
@@ -45,6 +50,7 @@ echo [qwen3.8-27b-nvfp4full-dflash2-262k] vision + DFlash2 k=7, native 262144 co
   --max-concurrency 4 ^
   --kv-ram-capacity 8192 ^
   --kv-capacity 420000 ^
+  --request-log-jsonl "%JSONL%" ^
   %*
 
 exit /b %ERRORLEVEL%
