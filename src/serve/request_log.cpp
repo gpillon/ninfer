@@ -334,6 +334,30 @@ std::string speculative_str(const GenerationMetrics& metrics) {
                                   static_cast<double>(metrics.speculative_draft_tokens);
         out << " (" << std::setprecision(1) << accept_pct << "%)";
     }
+    // A fixed-width backend has no window histogram to print, but it does have a per-slot
+    // acceptance profile, which is the diagnostic that matters there: a block drafter decaying
+    // toward the end of its block looks completely different from one that is simply wrong, and
+    // both show the same tok/round. Printed as accepted/drafted percentages, slot 1 first.
+    if (!metrics.speculative_adaptive && !metrics.speculative_drafted_per_position.empty()) {
+        out << " pos=[" << std::setprecision(0);
+        for (std::size_t i = 0; i < metrics.speculative_drafted_per_position.size(); ++i) {
+            if (i != 0) { out << ','; }
+            const std::uint64_t drafted = metrics.speculative_drafted_per_position[i];
+            if (drafted == 0) {
+                out << '-';
+                continue;
+            }
+            const std::uint64_t accepted =
+                i < metrics.speculative_accepted_per_position.size()
+                    ? metrics.speculative_accepted_per_position[i]
+                    : 0;
+            out << (100.0 * static_cast<double>(accepted) / static_cast<double>(drafted));
+        }
+        out << ']';
+        if (metrics.speculative_fallback_steps != 0) {
+            out << " fallback=" << metrics.speculative_fallback_steps;
+        }
+    }
     if (metrics.speculative_adaptive && !metrics.speculative_rounds_per_window.empty()) {
         out << " widths=[";
         for (std::size_t i = 0; i < metrics.speculative_rounds_per_window.size(); ++i) {
