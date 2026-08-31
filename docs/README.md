@@ -40,6 +40,8 @@ API documentation.
 
 Runtime and Op references:
 
+- [gpillon fork changes](maintainer/gpillon-fork-changes.md) — host-RAM KV cache, prefix-reuse
+  admission, tagged request lanes, adaptive MTP, and streaming fixes local to this branch
 - [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)

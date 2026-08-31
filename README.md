@@ -1,3 +1,36 @@
+# NInfer — gpillon fork
+
+## About this fork
+
+**The problem this branch fixes**: the upstream engine was not built with coding-agent workloads in
+mind. A tool like Qwen Code fires bursts of near-identical subagent requests that share the same
+long system prompt and tool schemas (often 98% identical) and diverge only in a short task-specific
+tail — but the engine had a single global prefill lane with no concept of "these requests are
+mostly the same": every subagent redid the full prefill from scratch, serialized one behind another,
+producing time-to-first-token ladders of several seconds per subagent even though almost none of
+that work was actually new. A long-running main conversation and a one-shot classifier call were
+also indistinguishable to the scheduler, so the conversation the user was waiting on could get
+evicted and re-prefilled at the worst possible moment.
+
+This branch adds, on top of the cometkim integration branch below: a host-RAM KV cache tier that
+snapshots finished or still-decoding GPU lanes so a sibling request can restore instead of
+re-prefilling; prefix-reuse and admission work so concurrent identical or shared-prefix requests
+(a subagent burst sharing one long system+tools prompt) skip the redundant part of prefill entirely;
+and tagged request lanes (`@main`/`@agents`/`@classifier`, see below) so the scheduler now knows
+which lane is the long-lived conversation and protects it from eviction by short-lived traffic.
+Measured effect: siblings that used to pay a full prefill (hundreds to thousands of ms) now restore
+in tens to a few hundred ms, and a burst of subagents sharing a system+tools prefix reuses ~99% of
+it instead of queueing behind each other's redundant prefill. Also included: adaptive MTP
+verification-width selection calibrated from measured round cost (higher decode throughput), RTX
+5090 Laptop cooperative-launch/MTP-tuning compatibility fixes carried for portability (not this
+machine's own GPU), and streaming/tool-call-parsing hardening. Two silent KV-corruption bugs found
+along the way (a rewrite-checkpoint restore and a hyperquant exact-key side store, both serving one
+request with another's state) are fixed or mitigated as noted in the details doc.
+
+Details, rationale, and file-level pointers: [gpillon fork changes](docs/maintainer/gpillon-fork-changes.md).
+
+---
+
 # NInfer — cometkim fork
 
 ## About this fork
@@ -531,6 +564,61 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 The server also implements OpenAI Responses Core (typed Items, semantic SSE, local continuation
 state, and function calls) plus Anthropic Messages, token counting, and multimodal input. See
 [HTTP serving](docs/serving.md).
+
+### Request lanes for coding agents (`@main` / `@agents` / `@classifier`)
+
+*(gpillon fork addition — see [About this fork](#about-this-fork) above for why this exists.)*
+
+Append `@main`, `@agents`, or `@classifier` to the `model` field to tell the scheduler what kind of
+request this is, so lane eviction and prefix reuse can treat it accordingly:
+
+| Tag | For | Eviction priority |
+|---|---|---|
+| `@main` | the long-lived, user-facing conversation | protected — ranked **last** among eviction candidates, so short-lived traffic never forces it to re-prefill |
+| `@agents` | short-lived subagent/tool-delegation calls (also the **default** for an untagged model id) | recycled freely |
+| `@classifier` | one-shot intent/routing/classification calls | recycled freely |
+
+```bash
+# The user-facing conversation — protect this lane from eviction.
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.6-27b@main",
+    "messages": [{"role": "user", "content": "Continue the conversation."}],
+    "max_tokens": 512
+  }'
+
+# A subagent spawned by the main conversation — freely recyclable, and if its
+# prompt shares a long system+tools prefix with a sibling already running
+# (the common case for a burst of subagents from the same tool), it reuses
+# that prefix instead of re-prefilling.
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.6-27b@agents",
+    "messages": [{"role": "system", "content": "<same long system+tools prompt>"},
+                 {"role": "user", "content": "<subagent task N>"}],
+    "max_tokens": 256
+  }'
+
+# A one-shot intent classifier — same recycling tier as @agents, kept
+# separate so its churn is visible on its own in the throughput log.
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.6-27b@classifier",
+    "messages": [{"role": "user", "content": "Classify: <text>"}],
+    "max_tokens": 8
+  }'
+```
+
+Benefits in practice: fire ten subagent requests against `@agents` while a `@main` conversation is
+mid-decode, and the main conversation's lane is never chosen as the eviction victim — the subagents
+recycle each other's lanes first. Subagents sharing a system+tools prefix restore most of it from
+the host-RAM cache instead of re-prefilling, so time-to-first-token drops from full-prefill latency
+(hundreds of ms to multiple seconds, depending on prompt length) to the cost of re-hashing and
+copying a cached prefix (tens to a couple hundred ms). Untagged requests keep working exactly as
+before, classified as `@agents`.
 
 ## Capabilities
 
