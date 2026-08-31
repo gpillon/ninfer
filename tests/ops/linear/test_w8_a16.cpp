@@ -15,9 +15,11 @@ constexpr Invocation convenience(std::int32_t t) { return {t, CallForm::A16Conve
 int w8_a16_conformance() {
     int failures = 0;
 
+    // 7/14/21/28 are the DFlash2 drafter's proposal-head widths: k columns per row for a
+    // one-to-four-lane batch. 8/16/24/32 are the matching target verify block widths.
     constexpr std::array kN248320K5120{
-        a16(1),  a16(6),  a16(16), a16(17), a16(32), a16(33),
-        a16(34), a16(48), a16(49), a16(64), a16(65),
+        a16(1),  a16(6),  a16(7),  a16(8),  a16(14), a16(16), a16(17), a16(21),
+        a16(24), a16(28), a16(32), a16(33), a16(34), a16(48), a16(49), a16(64), a16(65),
     };
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {248320, 5120, 197U, Comparison::Sampled, false, kN248320K5120});

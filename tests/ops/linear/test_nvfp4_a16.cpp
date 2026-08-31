@@ -37,9 +37,18 @@ int run_nvfp4_a16() {
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 17408, 707U, Comparison::Sampled, true, new_problem_invocations});
     // DFlash2 drafter problems (A16 weight-only).
+    // The drafter's live column counts: a block is (k+1)*B wide and its proposal tail k*B, so a
+    // four-lane engine issues 8/16/24/32 and 7/14/21/28 columns, not just the single-request 8.
     constexpr std::array dflash2_invocations{
         Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{7, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{14, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{21, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{24, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{28, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
@@ -52,6 +61,8 @@ int run_nvfp4_a16() {
                           {1280, 5120, 714U, Comparison::Sampled, true, dflash2_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {256, 5120, 715U, Comparison::Sampled, true, dflash2_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {5120, 17408, 716U, Comparison::Sampled, true, dflash2_invocations});
     return failures;
 }
 

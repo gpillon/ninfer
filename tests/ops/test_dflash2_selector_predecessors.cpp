@@ -20,16 +20,15 @@ std::vector<std::int32_t> predecessors_oracle(const std::vector<std::int32_t>& c
     for (int l = 0; l < lanes; ++l) {
         for (int s = 0; s < positions; ++s) {
             for (int j = 0; j < top_k; ++j) {
+                // [K, P, L] is contiguous: the draft position runs ahead of the lane.
+                const std::size_t slot =
+                    static_cast<std::size_t>(l) * positions + static_cast<std::size_t>(s);
                 const std::size_t index =
-                    static_cast<std::size_t>(j) +
-                    static_cast<std::size_t>(top_k) *
-                        (static_cast<std::size_t>(s) * lanes + l);
+                    static_cast<std::size_t>(j) + static_cast<std::size_t>(top_k) * slot;
                 expected[index] =
                     s == 0 ? anchors[static_cast<std::size_t>(l)]
                            : candidates[static_cast<std::size_t>(j) +
-                                         static_cast<std::size_t>(top_k) *
-                                             ((static_cast<std::size_t>(s) - 1) * lanes +
-                                              static_cast<std::size_t>(l))];
+                                        static_cast<std::size_t>(top_k) * (slot - 1)];
             }
         }
     }
@@ -78,6 +77,8 @@ int main() {
     // Real DFlash2 shape: 16 candidates over 7 draft positions.
     failures += run_case("predecessors k16 p7 l1", 16, 7, 1, 31);
     failures += run_case("predecessors k16 p7 l2", 16, 7, 2, 32);
+    failures += run_case("predecessors k16 p7 l3", 16, 7, 3, 35);
+    failures += run_case("predecessors k16 p7 l4", 16, 7, 4, 36);
     // Minimal and wide lattices.
     failures += run_case("predecessors k1 p1 l1", 1, 1, 1, 33);
     failures += run_case("predecessors k8 p15 l4", 8, 15, 4, 34);

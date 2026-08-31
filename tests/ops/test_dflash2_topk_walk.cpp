@@ -76,24 +76,23 @@ int run_walk_case(const char* label, std::int32_t top_k, std::int32_t positions,
     for (int l = 0; l < lanes; ++l) {
         int pred = 0;
         for (int s = 0; s < positions; ++s) {
+            // [K, P, L] is contiguous: the draft position runs ahead of the lane.
+            const std::size_t slot =
+                static_cast<std::size_t>(l) * positions + static_cast<std::size_t>(s);
             int best_i   = 0;
             float best_v = -1e30F;
             for (int i = 0; i < top_k; ++i) {
                 const float v = scores[static_cast<std::size_t>(i) +
                                       static_cast<std::size_t>(top_k) *
                                           (static_cast<std::size_t>(pred) +
-                                           static_cast<std::size_t>(top_k) *
-                                               (static_cast<std::size_t>(s) * lanes + l))];
+                                           static_cast<std::size_t>(top_k) * slot)];
                 if (v > best_v) {
                     best_v = v;
                     best_i = i;
                 }
             }
-            want[static_cast<std::size_t>(s) +
-                 static_cast<std::size_t>(positions) * l] =
-                candidates[static_cast<std::size_t>(best_i) +
-                           static_cast<std::size_t>(top_k) *
-                               (static_cast<std::size_t>(s) * lanes + l)];
+            want[slot] = candidates[static_cast<std::size_t>(best_i) +
+                                    static_cast<std::size_t>(top_k) * slot];
             pred = best_i;
         }
     }
@@ -119,10 +118,16 @@ int main() {
     }
     int failures = 0;
     failures += run_topk_case("topk 248320 c7 k16", 248320, 7, 16, 31);
+    // A four-lane drafter proposes k columns per row in one call: 14, 21 and 28 columns.
+    failures += run_topk_case("topk 248320 c14 k16", 248320, 14, 16, 34);
+    failures += run_topk_case("topk 248320 c21 k16", 248320, 21, 16, 35);
+    failures += run_topk_case("topk 248320 c28 k16", 248320, 28, 16, 36);
     failures += run_topk_case("topk 1000 c3 k4", 1000, 3, 4, 32);
     failures += run_topk_case("topk 33 c1 k32", 33, 1, 32, 33);
     failures += run_walk_case("walk k16 p7 l1", 16, 7, 1, 41);
     failures += run_walk_case("walk k16 p7 l2", 16, 7, 2, 42);
+    failures += run_walk_case("walk k16 p7 l3", 16, 7, 3, 44);
+    failures += run_walk_case("walk k16 p7 l4", 16, 7, 4, 45);
     failures += run_walk_case("walk k4 p15 l8", 4, 15, 8, 43);
     if (failures == 0) {
         std::cout << "dflash2_topk+walk: ALL PASSED\n";

@@ -107,6 +107,12 @@ int main() {
     failures += run_case("conv 5120 b8 l1 side0", 5120, 8, 1, 0, 11);
     failures += run_case("conv 5120 b8 l1 side1", 5120, 8, 1, 1, 12);
     failures += run_case("conv 5120 b8 l2 side0", 5120, 8, 2, 0, 13);
+    // The served concurrency envelope at the real drafter shape: one block per lane, both sides.
+    failures += run_case("conv 5120 b8 l2 side1", 5120, 8, 2, 1, 21);
+    failures += run_case("conv 5120 b8 l3 side0", 5120, 8, 3, 0, 22);
+    failures += run_case("conv 5120 b8 l3 side1", 5120, 8, 3, 1, 23);
+    failures += run_case("conv 5120 b8 l4 side0", 5120, 8, 4, 0, 24);
+    failures += run_case("conv 5120 b8 l4 side1", 5120, 8, 4, 1, 25);
     // Degenerate blocks: a single position (both taps read the zero pad).
     failures += run_case("conv 64 b1 l1 side1", 64, 1, 1, 1, 14);
     // Wider block exercises the tap gather across positions.

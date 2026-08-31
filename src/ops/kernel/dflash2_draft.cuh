@@ -70,18 +70,22 @@ __global__ void dflash2_selector_scores_kernel(
     const std::uint8_t* __restrict__ predecessor_scales, float predecessor_inverse_divisor,
     std::int32_t rank, std::int32_t top_k, std::int32_t positions, std::int32_t lanes,
     float* __restrict__ out) {
-    const int idx = blockIdx.x;  // one block per (i, j, s, l)
-    const int l   = idx % lanes;
-    const int s   = (idx / lanes) % positions;
-    const int j   = (idx / (lanes * positions)) % top_k;
-    const int i   = idx / (lanes * positions * top_k);
+    // One block per (i, j, s, l), enumerated so the block index is the output element index.
+    const int idx = blockIdx.x;
+    const int i   = idx % top_k;
+    const int j   = (idx / top_k) % top_k;
+    const int s   = (idx / (top_k * top_k)) % positions;
+    const int l   = idx / (top_k * top_k * positions);
 
-    const std::int64_t slot = static_cast<std::int64_t>(s) * lanes + l;
+    // [K, P, L] is contiguous with the draft position ahead of the lane, so the per-position
+    // vector (x, s, l) sits at x + K * (s + P * l). Putting the lane first here is the whole
+    // batch>1 defect: it is the identity at L = 1 and a transpose at every wider batch.
+    const std::int64_t slot = static_cast<std::int64_t>(l) * positions + s;
     const std::int32_t succ_id = candidates[static_cast<std::int64_t>(i) + top_k * slot];
     const std::int32_t pred_id = pred_ids[static_cast<std::int64_t>(j) + top_k * slot];
     const std::int64_t succ_row  = static_cast<std::int64_t>(succ_id) * rank;
     const std::int64_t pred_row  = static_cast<std::int64_t>(pred_id) * rank;
-    const float* h               = hidden_proj + (static_cast<std::int64_t>(s) * lanes + l) * rank;
+    const float* h               = hidden_proj + slot * rank;
 
     float local = 0.0F;
     for (int r = threadIdx.x; r < rank; r += blockDim.x) {
@@ -203,7 +207,7 @@ __global__ void dflash2_selector_walk_kernel(const float* __restrict__ scores,
     if (l >= lanes) { return; }
     int pred = 0;
     for (int s = 0; s < positions; ++s) {
-        const std::int64_t slot = static_cast<std::int64_t>(s) * lanes + l;
+        const std::int64_t slot = static_cast<std::int64_t>(l) * positions + s;
         int best_i   = 0;
         float best_v = -INFINITY;
         for (int i = 0; i < top_k; ++i) {
@@ -214,15 +218,14 @@ __global__ void dflash2_selector_walk_kernel(const float* __restrict__ scores,
                 best_i = i;
             }
         }
-        out[static_cast<std::int64_t>(s) +
-            static_cast<std::int64_t>(positions) * l] =
-            candidates[static_cast<std::int64_t>(best_i) + top_k * slot];
+        out[slot] = candidates[static_cast<std::int64_t>(best_i) + top_k * slot];
         pred = best_i;
     }
 }
 
-// One thread per (j, s, l): the predecessor id feeding transition slot (j, s, l)
-// is the anchor at s = 0 and candidate j from slot s-1 afterwards.
+// One thread per (j, s, l), enumerated so the thread index is the output element index: the
+// predecessor id feeding transition slot (j, s, l) is the anchor at s = 0 and candidate j from
+// the previous draft position afterwards.
 __global__ void dflash2_selector_predecessors_kernel(const std::int32_t* __restrict__ candidates,
                                                      const std::int32_t* __restrict__ anchors,
                                                      std::int32_t top_k, std::int32_t positions,
@@ -230,13 +233,12 @@ __global__ void dflash2_selector_predecessors_kernel(const std::int32_t* __restr
                                                      std::int32_t* __restrict__ out) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= top_k * positions * lanes) { return; }
-    const int l = idx % lanes;
-    const int s = (idx / lanes) % positions;
-    const int j = idx / (lanes * positions);
-    const std::int64_t slot = static_cast<std::int64_t>(s) * lanes + l;
+    const int j = idx % top_k;
+    const int s = (idx / top_k) % positions;
+    const int l = idx / (top_k * positions);
+    const std::int64_t slot = static_cast<std::int64_t>(l) * positions + s;
     const std::int32_t value =
         s == 0 ? anchors[l]
-               : candidates[static_cast<std::int64_t>(j) +
-                            top_k * (slot - lanes)];
+               : candidates[static_cast<std::int64_t>(j) + top_k * (slot - 1)];
     out[static_cast<std::int64_t>(j) + top_k * slot] = value;
 }

@@ -330,6 +330,100 @@ int run_batch_case() {
     return failures;
 }
 
+// The DFlash2 drafter runs a whole B*T block in one call: T=k+1 query columns per row over a
+// 2048-slot cyclic context, with one lane per concurrent request. A batched launch must agree
+// element-for-element with the same rows launched one at a time; anything that leaks across the
+// batch dimension shows up here and nowhere in the B=1 cases.
+int run_batch_shape_case(int tokens, int batch, int window, int base_position) {
+    const std::size_t row_q_count        = static_cast<std::size_t>(kD) * kQHeads * tokens;
+    const std::size_t row_kv_count       = static_cast<std::size_t>(kD) * kKVHeads * tokens;
+    const std::size_t lane_context_count = static_cast<std::size_t>(kD) * window * kKVHeads;
+    std::vector<float> q(row_q_count * batch);
+    std::vector<float> query_k(row_kv_count * batch);
+    std::vector<float> query_v(row_kv_count * batch);
+    std::vector<float> context_k(lane_context_count * batch);
+    std::vector<float> context_v(lane_context_count * batch);
+    fill_uniform(q, 5101u, -0.35f, 0.35f);
+    fill_uniform(query_k, 5209u, -0.4f, 0.4f);
+    fill_uniform(query_v, 5303u, -0.8f, 0.8f);
+    fill_uniform(context_k, 5407u, -0.4f, 0.4f);
+    fill_uniform(context_v, 5501u, -0.8f, 0.8f);
+    round_to_bf16(q);
+    round_to_bf16(query_k);
+    round_to_bf16(query_v);
+    round_to_bf16(context_k);
+    round_to_bf16(context_v);
+
+    // Distinct frontiers and lanes per row, exactly as concurrent requests present them.
+    std::vector<int> positions(static_cast<std::size_t>(tokens) * batch);
+    std::vector<std::int32_t> valid(batch);
+    std::vector<std::int32_t> lanes(batch);
+    int envelope_max = 0;
+    for (int b = 0; b < batch; ++b) {
+        const int frontier = base_position + 37 * b;
+        for (int i = 0; i < tokens; ++i) {
+            positions[static_cast<std::size_t>(b) * tokens + i] = frontier + i;
+        }
+        valid[static_cast<std::size_t>(b)] = tokens;
+        lanes[static_cast<std::size_t>(b)] = (batch - 1) - b;
+        envelope_max                       = std::max(envelope_max, frontier);
+    }
+
+    DeviceBuffer d_q         = to_device(bf16_bits(q));
+    DeviceBuffer d_query_k   = to_device(bf16_bits(query_k));
+    DeviceBuffer d_query_v   = to_device(bf16_bits(query_v));
+    DeviceBuffer d_context_k = to_device(bf16_bits(context_k));
+    DeviceBuffer d_context_v = to_device(bf16_bits(context_v));
+    DeviceBuffer d_positions = to_device_i32(positions);
+    DeviceBuffer d_valid     = to_device(valid);
+    DeviceBuffer d_lanes     = to_device(lanes);
+    GuardedDeviceBuffer d_out(row_q_count * batch * sizeof(std::uint16_t));
+    d_out.fill(0x7f);
+
+    Tensor q_tensor(d_q.p, DType::BF16, {kD, kQHeads, tokens, batch});
+    Tensor query_k_tensor(d_query_k.p, DType::BF16, {kD, kKVHeads, tokens, batch});
+    Tensor query_v_tensor(d_query_v.p, DType::BF16, {kD, kKVHeads, tokens, batch});
+    Tensor positions_tensor(d_positions.p, DType::I32, {tokens, batch});
+    Tensor valid_tensor(d_valid.p, DType::I32, {batch});
+    Tensor lanes_tensor(d_lanes.p, DType::I32, {batch});
+    Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, batch});
+    const ops::SwaContextExecutionEnvelope envelope{0, static_cast<std::uint32_t>(envelope_max)};
+    DeviceArena workspace(ops::swa_workspace_capacity_bytes(envelope, tokens, tokens, batch));
+    auto context = make_context_view(d_context_k, d_context_v, window, batch);
+
+    std::vector<std::uint16_t> expected(row_q_count * batch);
+    DeviceArena single_workspace(ops::swa_workspace_capacity_bytes(envelope, tokens, tokens, 1));
+    for (int b = 0; b < batch; ++b) {
+        GuardedDeviceBuffer single_out(row_q_count * sizeof(std::uint16_t));
+        Tensor single_out_tensor(single_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
+        Tensor q_row         = q_tensor.slice(3, b, 1);
+        Tensor query_k_row   = query_k_tensor.slice(3, b, 1);
+        Tensor query_v_row   = query_v_tensor.slice(3, b, 1);
+        Tensor positions_row = positions_tensor.slice(1, b, 1);
+        Tensor valid_row     = valid_tensor.slice(0, b, 1);
+        Tensor lane_row      = lanes_tensor.slice(0, b, 1);
+        ops::swa(q_row, query_k_row, query_v_row, positions_row, valid_row, lane_row, kScale,
+                 context, envelope, single_workspace, single_out_tensor, nullptr);
+        cuda_synchronize();
+        const auto row = from_device<std::uint16_t>(single_out.data(), row_q_count);
+        std::copy(row.begin(), row.end(),
+                  expected.begin() + static_cast<std::ptrdiff_t>(b * row_q_count));
+    }
+
+    ops::swa(q_tensor, query_k_tensor, query_v_tensor, positions_tensor, valid_tensor, lanes_tensor,
+             kScale, context, envelope, workspace, out_tensor, nullptr);
+    cuda_synchronize();
+
+    const std::string label = "swa B=" + std::to_string(batch) + " T=" + std::to_string(tokens) +
+                              " W=" + std::to_string(window) + " L=" +
+                              std::to_string(base_position);
+    int failures = verify_exact(label.c_str(),
+                                from_device<std::uint16_t>(d_out.data(), row_q_count * batch),
+                                expected);
+    failures += d_out.verify_guards((label + " output guards").c_str());
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -364,6 +458,12 @@ int main() {
     failures += run_case(8, 3000, InputProfile::Random, 3000, 2048);
     failures += run_case(2, 2048, InputProfile::WindowBoundary, 2048, 2048);
     failures += run_batch_case();
+    // The served DFlash2 shape: an eight-column block per row over the 2048 ring, at every
+    // concurrency the engine captures a decode graph for.
+    for (int batch = 2; batch <= 4; ++batch) {
+        failures += run_batch_shape_case(8, batch, 2048, 96);
+        failures += run_batch_shape_case(8, batch, 2048, 3000);
+    }
 
     if (failures != 0) {
         std::cerr << "swa failures=" << failures << '\n';

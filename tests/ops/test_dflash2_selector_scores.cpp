@@ -117,32 +117,29 @@ std::vector<double> scores_oracle(const std::vector<std::int32_t>& candidates,
     std::vector<double> expected(static_cast<std::size_t>(top_k) * top_k * positions * lanes);
     for (int l = 0; l < lanes; ++l) {
         for (int s = 0; s < positions; ++s) {
+            // [K, P, L] is contiguous: the draft position runs ahead of the lane.
+            const std::size_t slot =
+                static_cast<std::size_t>(l) * positions + static_cast<std::size_t>(s);
             for (int j = 0; j < top_k; ++j) {
                 const auto pred_id = static_cast<std::size_t>(
                     pred_ids[static_cast<std::size_t>(j) +
-                             static_cast<std::size_t>(top_k) *
-                                 (static_cast<std::size_t>(s) * lanes + l)]);
+                             static_cast<std::size_t>(top_k) * slot]);
                 for (int i = 0; i < top_k; ++i) {
                     const auto succ_id = static_cast<std::size_t>(
                         candidates[static_cast<std::size_t>(i) +
-                                   static_cast<std::size_t>(top_k) *
-                                       (static_cast<std::size_t>(s) * lanes + l)]);
+                                   static_cast<std::size_t>(top_k) * slot]);
                     double dot = 0.0;
                     for (int r = 0; r < rank; ++r) {
                         dot += successor[succ_id * rank + r] * predecessor[pred_id * rank + r] *
-                               static_cast<double>(
-                                   hidden_proj[(static_cast<std::size_t>(s) * lanes + l) * rank +
-                                               r]);
+                               static_cast<double>(hidden_proj[slot * rank + r]);
                     }
                     dot += static_cast<double>(
                         unary[static_cast<std::size_t>(i) +
-                              static_cast<std::size_t>(top_k) *
-                                  (static_cast<std::size_t>(s) * lanes + l)]);
+                              static_cast<std::size_t>(top_k) * slot]);
                     expected[static_cast<std::size_t>(i) +
                              static_cast<std::size_t>(top_k) *
                                  (static_cast<std::size_t>(j) +
-                                  static_cast<std::size_t>(top_k) *
-                                      (static_cast<std::size_t>(s) * lanes + l))] = dot;
+                                  static_cast<std::size_t>(top_k) * slot)] = dot;
                 }
             }
         }
@@ -214,6 +211,8 @@ int main() {
     failures += run_case("selector r256 k16 p7 l1", 256, 16, 7, 1, 4096, 21);
     // Two lanes share the codebooks through gathered rows.
     failures += run_case("selector r256 k16 p7 l2", 256, 16, 7, 2, 4096, 22);
+    failures += run_case("selector r256 k16 p7 l3", 256, 16, 7, 3, 4096, 25);
+    failures += run_case("selector r256 k16 p7 l4", 256, 16, 7, 4, 4096, 26);
     // Minimal shapes: one candidate and one position collapse the lattice.
     failures += run_case("selector r64 k1 p1 l1", 64, 1, 1, 1, 512, 23);
     failures += run_case("selector r512 k8 p3 l4", 512, 8, 3, 4, 1024, 24);
