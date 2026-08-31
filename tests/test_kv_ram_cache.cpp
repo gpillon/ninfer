@@ -1680,6 +1680,191 @@ int test_spill_drop_keeps_indexed_source(ninfer::DeviceContext& ctx, ninfer::Pag
     return failures;
 }
 
+// The DFlash2 drafter rides the record's cyclic-cache fields, which are geometry-generic: the
+// header stores layers/capacity/padded/kv_heads/head_dim/lane_bytes and verify_cyclic rechecks
+// them on restore. This exercises the drafter's own shape (5 SWA layers, 8 KV heads, head width
+// 128, one plane per lane) rather than the small fixture geometry, and pins the record-size
+// accounting: two cyclic caches cost exactly two lane images, and the checkpoint plane is only
+// charged when the source declares a valid rewrite checkpoint.
+int test_dflash2_drafter_geometry(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    // DFlash2Config's shape, with the 2048-entry window scaled down: capacity does not change what
+    // is under test here (it only multiplies the lane image) and a full window would cost 40 MiB a
+    // lane on the device for no extra coverage.
+    constexpr std::uint32_t kLayers      = 5;
+    constexpr std::uint32_t kWindow      = 128;
+    constexpr std::int32_t kKvHeads      = 8;
+    constexpr std::int32_t kHeadDim      = 128;
+    constexpr std::int32_t kLaneCapacity = 2;
+
+    ninfer::LayoutBuilder local_builder;
+    const auto local_layout = ninfer::plan_cyclic_kv_cache(local_builder, kLayers, kWindow,
+                                                           kKvHeads, kHeadDim, kLaneCapacity);
+    ninfer::DeviceArena local_arena(local_builder.finish(256));
+    ninfer::CyclicKVCache local({local_arena.base(), local_arena.capacity()}, local_layout);
+    ninfer::LayoutBuilder ckpt_builder;
+    const auto ckpt_layout = ninfer::plan_cyclic_kv_cache(ckpt_builder, kLayers, kWindow, kKvHeads,
+                                                          kHeadDim, kLaneCapacity);
+    ninfer::DeviceArena ckpt_arena(ckpt_builder.finish(256));
+    ninfer::CyclicKVCache ckpt({ckpt_arena.base(), ckpt_arena.capacity()}, ckpt_layout);
+
+    // A distinct byte per (cache, layer) so a plane read back from the wrong layer or the wrong
+    // cache cannot pass, and lane 1 stays zero so a lane-indexing error shows up as zeros.
+    for (std::uint32_t layer = 0; layer < kLayers; ++layer) {
+        ninfer::CyclicKVCacheLayerView local_view = local.layer_view(layer);
+        CUDA_CHECK(cudaMemset(local_view.k.slice(3, 0, 1).data, static_cast<int>(0x10U + layer),
+                              local_view.k.slice(3, 0, 1).bytes()));
+        CUDA_CHECK(cudaMemset(local_view.v.slice(3, 0, 1).data, static_cast<int>(0x20U + layer),
+                              local_view.v.slice(3, 0, 1).bytes()));
+        ninfer::CyclicKVCacheLayerView ckpt_view = ckpt.layer_view(layer);
+        CUDA_CHECK(cudaMemset(ckpt_view.k.slice(3, 0, 1).data, static_cast<int>(0x30U + layer),
+                              ckpt_view.k.slice(3, 0, 1).bytes()));
+        CUDA_CHECK(cudaMemset(ckpt_view.v.slice(3, 0, 1).data, static_cast<int>(0x40U + layer),
+                              ckpt_view.v.slice(3, 0, 1).bytes()));
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto text_plan =
+        plan_paged_cache(4, 4, 2, {{ninfer::DType::I8, 16, 2}, {ninfer::DType::I8, 16, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 0x5a);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    ninfer::DeviceBuffer hidden_buf(128);
+    hidden_buf.fill(0xb1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
+
+    const auto prompt                = text_prompt({5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid      = source.execution_frontier;
+    // What DFlash2 actually reports: no MTP prefix, and the drafter's context vouched for by the
+    // frontier scalar it shares with v1. The backend KV plane is absent by construction, since
+    // DFlash2 claims no paged backend pages at all.
+    source.mtp_kv_valid            = 0;
+    source.dflash_context_frontier = source.execution_frontier;
+    source.tail_hidden_valid       = true;
+    source.ledger                  = retained.token_ids;
+    source.identity                = &identity;
+    source.hash_f =
+        q36::detail::prefix_hash_at(retained.token_ids, identity, source.execution_frontier);
+    source.text        = &text;
+    source.text_pool   = &text_pool;
+    source.text_pages  = text.mapped_page_count();
+    source.tail_hidden = &hidden;
+    source.stream      = ctx.stream;
+
+    q36::detail::KVRamCache cache(64ULL << 20);
+    const std::size_t without_drafter = cache.capture_bytes(source);
+    source.dflash_local               = &local;
+    source.dflash_lane                = 0;
+    const std::size_t with_local      = cache.capture_bytes(source);
+    source.rewrite_valid              = true;
+    source.rewrite_kind               = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier           = 2;
+    source.hash_c_valid               = true;
+    source.hash_c            = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
+    source.rewrite_checkpoint_hidden = &hidden;
+    source.dflash_checkpoint         = &ckpt;
+    const std::size_t with_both      = cache.capture_bytes(source);
+
+    int failures                 = 0;
+    const std::size_t lane_bytes = local.lane_host_bytes();
+    if (with_local - without_drafter != lane_bytes) {
+        std::cerr << "drafter local plane is not charged exactly one lane image\n";
+        ++failures;
+    }
+    if (with_both - with_local < lane_bytes) {
+        std::cerr << "drafter checkpoint plane is not charged a lane image\n";
+        ++failures;
+    }
+
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("drafter-geometry capture failed");
+    }
+    const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match) {
+        text.release();
+        return fail("drafter-geometry record did not index");
+    }
+
+    // Restore into lane 1, the lane the capture left zeroed: a record that silently skipped the
+    // drafter planes would leave those zeros in place and still read as a pass on the target KV.
+    auto text_dest = text_pool.reserve(2);
+    text_dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out_buf(128);
+    hidden_out_buf.fill(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {128});
+    ninfer::DeviceBuffer rewrite_out_buf(128);
+    rewrite_out_buf.fill(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ninfer::Tensor rewrite_out(rewrite_out_buf.p, ninfer::DType::U8, {128});
+
+    q36::detail::RamRestoreTarget target;
+    target.text_dst_pages            = 2;
+    target.text                      = &text_dest;
+    target.text_pool                 = &text_pool;
+    target.tail_hidden               = &hidden_out;
+    target.rewrite_checkpoint_hidden = &rewrite_out;
+    target.dflash_local              = &local;
+    target.dflash_checkpoint         = &ckpt;
+    target.dflash_lane               = 1;
+    target.stream                    = ctx.stream;
+    const q36::detail::RamRestoredHost host = cache.unpack_device(match->entry_id, target);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+
+    if (host.dflash_context_frontier != source.dflash_context_frontier) {
+        std::cerr << "drafter context frontier did not round-trip\n";
+        ++failures;
+    }
+    const auto expect_plane = [&](const ninfer::Tensor& plane, unsigned char value,
+                                  const char* label, std::uint32_t layer) {
+        std::vector<unsigned char> out(plane.bytes());
+        CUDA_CHECK(cudaMemcpy(out.data(), plane.data, out.size(), cudaMemcpyDeviceToHost));
+        if (std::any_of(out.begin(), out.end(),
+                        [&](unsigned char byte) { return byte != value; })) {
+            std::cerr << "drafter " << label << " layer " << layer
+                      << " did not round-trip into the restored lane\n";
+            ++failures;
+        }
+    };
+    for (std::uint32_t layer = 0; layer < kLayers; ++layer) {
+        expect_plane(local.layer_view(layer).k.slice(3, 1, 1),
+                     static_cast<unsigned char>(0x10U + layer), "local K", layer);
+        expect_plane(local.layer_view(layer).v.slice(3, 1, 1),
+                     static_cast<unsigned char>(0x20U + layer), "local V", layer);
+        expect_plane(ckpt.layer_view(layer).k.slice(3, 1, 1),
+                     static_cast<unsigned char>(0x30U + layer), "checkpoint K", layer);
+        expect_plane(ckpt.layer_view(layer).v.slice(3, 1, 1),
+                     static_cast<unsigned char>(0x40U + layer), "checkpoint V", layer);
+    }
+
+    text.release();
+    text_dest.release();
+    return failures;
+}
+
 int test_full_state_image(ninfer::DeviceContext& ctx) {
     namespace q36 = ninfer::targets::qwen3_6;
     auto text_plan =
@@ -2128,6 +2313,7 @@ int main() {
     failures += test_destructor_with_inflight_copies(ctx, paged_pool);
     failures += test_spill_drop_keeps_indexed_source(ctx, paged_pool);
     failures += test_full_state_image(ctx);
+    failures += test_dflash2_drafter_geometry(ctx);
     // Guarded: a test that throws during its own setup would otherwise abort the process with no
     // diagnostic at all, which reads exactly like a clean pass to anything checking only for
     // absence of failure output.

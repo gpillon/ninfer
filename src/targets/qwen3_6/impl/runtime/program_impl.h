@@ -1103,6 +1103,17 @@ ProgramImplCore::ram_capture_source_unchecked(const SequenceState& sequence) {
             source.dflash_checkpoint = &dflash->rewrite_checkpoint_local;
         }
         source.dflash_lane = static_cast<std::int32_t>(sequence.lane);
+    } else if (dflash2) {
+        // The record's cyclic-cache fields are geometry-generic (a CyclicKVCache plus a lane row,
+        // with the header carrying layers/capacity/heads/head_dim and verify_cyclic rechecking
+        // them on restore), so the drafter rides them exactly as v1 does. Only the two cyclic
+        // caches belong here: prefill_features/prefill_positions are chunk-scoped scratch with no
+        // lane dimension, and pending_features is rebuilt every round by prepare_ragged_prefix.
+        source.dflash_local = &dflash2->local;
+        if (sequence.rewrite_checkpoint.valid) {
+            source.dflash_checkpoint = &dflash2->rewrite_checkpoint_local;
+        }
+        source.dflash_lane = static_cast<std::int32_t>(sequence.lane);
     }
     source.stream = device.stream;
     source.owner_class = sequence.owner_class;
@@ -1145,7 +1156,11 @@ qwen3_6::detail::RamCaptureSource ProgramImplCore::active_sibling_capture_source
     source.rope_delta              = sequence.rope_delta;
     source.text_kv_valid           = frontier;
     source.mtp_kv_valid            = speculative_backend == SpeculativeBackend::Mtp ? frontier - 1 : 0;
-    source.dflash_context_frontier = speculative_backend == SpeculativeBackend::DFlash ? frontier : 0;
+    source.dflash_context_frontier =
+        speculative_backend == SpeculativeBackend::DFlash ||
+                speculative_backend == SpeculativeBackend::DFlash2
+            ? frontier
+            : 0;
     source.tail_hidden_valid       = true;
     source.ledger                  = ledger;
     source.identity                = &identity;
@@ -1166,7 +1181,9 @@ qwen3_6::detail::RamCaptureSource ProgramImplCore::active_sibling_capture_source
     source.gdn_current_slot = LinearStateSlots::rewrite_checkpoint_state_slot(
         sequence.lane, max_concurrency);
     source.tail_hidden  = &sequence.rewrite_checkpoint_hidden;
-    source.dflash_local = dflash ? &dflash->rewrite_checkpoint_local : nullptr;
+    source.dflash_local = dflash    ? &dflash->rewrite_checkpoint_local
+                          : dflash2 ? &dflash2->rewrite_checkpoint_local
+                                    : nullptr;
     source.dflash_lane  = static_cast<std::int32_t>(sequence.lane);
     source.stream       = device.stream;
     source.multi_claim  = true;
@@ -1197,7 +1214,8 @@ qwen3_6::detail::RamCaptureSource ProgramImplCore::shared_boundary_capture_sourc
                                                      : frontier - 1)
                               : 0;
     source.dflash_context_frontier =
-        speculative_backend == SpeculativeBackend::DFlash
+        speculative_backend == SpeculativeBackend::DFlash ||
+                speculative_backend == SpeculativeBackend::DFlash2
             ? (sequence != nullptr ? std::min(sequence->dflash_context_frontier, frontier)
                                    : frontier)
             : 0;
@@ -1223,7 +1241,7 @@ qwen3_6::detail::RamCaptureSource ProgramImplCore::shared_boundary_capture_sourc
     source.residual_row = sequence != nullptr ? static_cast<std::int32_t>(sequence->lane) : 0;
     source.gdn          = &decoder->linear_attention;
     source.tail_hidden  = sequence != nullptr ? &sequence->tail_hidden : &sequences[0].tail_hidden;
-    source.dflash_local = dflash ? &dflash->local : nullptr;
+    source.dflash_local = dflash ? &dflash->local : dflash2 ? &dflash2->local : nullptr;
     source.capture_kind = kind;
     source.multi_claim  = true;
     if (sequence != nullptr) {
@@ -1402,6 +1420,10 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
         if (dflash) {
             target.dflash_local      = &dflash->local;
             target.dflash_checkpoint = &dflash->rewrite_checkpoint_local;
+            target.dflash_lane       = static_cast<std::int32_t>(sequence.lane);
+        } else if (dflash2) {
+            target.dflash_local      = &dflash2->local;
+            target.dflash_checkpoint = &dflash2->rewrite_checkpoint_local;
             target.dflash_lane       = static_cast<std::int32_t>(sequence.lane);
         }
         target.stream = device.stream;
