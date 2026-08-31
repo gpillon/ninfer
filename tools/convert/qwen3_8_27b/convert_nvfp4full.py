@@ -287,6 +287,44 @@ def family_recipe_materialize(
     return family_recipe.materialize_recipe(tensor_recipe, reader, derived)
 
 
+def materialize_dflash2_object(
+    spec: inventory.TensorSpec,
+    reader: ShardReader,
+    device: torch.device,
+    parent_report: dict[str, object] | None = None,
+) -> bytes:
+    """Encode one DFlash2 module object from the incoai drafter checkpoint.
+
+    Shared with tools/artifact/graft_dflash2_module.py, which appends the module
+    to an already-converted module-less artifact instead of rebuilding one: both
+    paths must encode the module identically, so neither owns a private copy of
+    this branch.
+    """
+
+    tensor = family_recipe_materialize(recipe.DFLASH2_RECIPES_BY_NAME[spec.name], reader)
+    if tuple(tensor.shape) != spec.shape:
+        raise ValueError(
+            f"{spec.name}: materialized shape {tuple(tensor.shape)} != {spec.shape}"
+        )
+    if spec.format != inventory.NVFP4:
+        return encode_direct(tensor, spec.format)
+    # Weight-only drafter parents: the fork's NVFP4 encoder, no activation
+    # calibration (the drafter runs A16).
+    payload = nvfp4_encode.encode_nvfp4_parent(tensor, device=device)
+    if parent_report is not None:
+        parent_report[spec.name] = {
+            "weight_scale_divisor": None,
+            "relative_frobenius_error": nvfp4_encode.relative_frobenius_error(
+                tensor,
+                nvfp4_encode.dequantize_nvfp4(
+                    nvfp4_encode.quantize_nvfp4(tensor, device=device),
+                    device=device,
+                ),
+            ),
+        }
+    return payload
+
+
 def _materialize_official(
     spec: inventory.TensorSpec,
     reader: ShardReader,
@@ -450,32 +488,12 @@ def convert(
                 elif spec.name in recipe.DFLASH2_RECIPES_BY_NAME:
                     if dflash2_reader is None:
                         raise RuntimeError("dflash2 spec reached without a source reader")
-                    tensor = family_recipe_materialize(
-                        recipe.DFLASH2_RECIPES_BY_NAME[spec.name], dflash2_reader
+                    payload = materialize_dflash2_object(
+                        spec,
+                        dflash2_reader,
+                        resolved_device,
+                        quantization_report["parents"],
                     )
-                    if spec.format == inventory.NVFP4:
-                        # Weight-only drafter parents: the fork's NVFP4 encoder,
-                        # no activation calibration (the drafter runs A16).
-                        payload = nvfp4_encode.encode_nvfp4_parent(
-                            tensor, device=resolved_device
-                        )
-                        quantization_report["parents"][spec.name] = {
-                            "weight_scale_divisor": None,
-                            "relative_frobenius_error": (
-                                nvfp4_encode.relative_frobenius_error(
-                                    tensor,
-                                    nvfp4_encode.dequantize_nvfp4(
-                                        nvfp4_encode.quantize_nvfp4(
-                                            tensor, device=resolved_device
-                                        ),
-                                        device=resolved_device,
-                                    ),
-                                )
-                            ),
-                        }
-                    else:
-                        payload = encode_direct(tensor, spec.format)
-                    del tensor
                 else:
                     payload = _materialize_official(
                         spec, base_reader, derived, resolved_device
