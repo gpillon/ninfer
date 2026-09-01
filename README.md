@@ -1,33 +1,50 @@
 # NInfer — gpillon fork
 
-## About this fork
+## Why this fork
 
-**The problem this branch fixes**: the upstream engine was not built with coding-agent workloads in
-mind. A tool like Qwen Code fires bursts of near-identical subagent requests that share the same
-long system prompt and tool schemas (often 98% identical) and diverge only in a short task-specific
-tail — but the engine had a single global prefill lane with no concept of "these requests are
-mostly the same": every subagent redid the full prefill from scratch, serialized one behind another,
-producing time-to-first-token ladders of several seconds per subagent even though almost none of
-that work was actually new. A long-running main conversation and a one-shot classifier call were
-also indistinguishable to the scheduler, so the conversation the user was waiting on could get
-evicted and re-prefilled at the worst possible moment.
+The upstream engine wasn't built with coding-agent workloads in mind. A tool like Qwen Code fires
+bursts of near-identical subagent requests that share the same long system prompt and tool schemas
+(often 98% identical) and diverge only in a short task-specific tail — but the engine had a single
+global prefill lane with no concept of "these requests are mostly the same": every subagent redid
+the full prefill from scratch, serialized one behind another, producing time-to-first-token ladders
+of several seconds per subagent even though almost none of that work was actually new. A
+long-running main conversation and a one-shot classifier call were also indistinguishable to the
+scheduler, so the conversation the user was waiting on could get evicted and re-prefilled at the
+worst possible moment. This fork exists to fix that: optimize the engine specifically for
+coding-tool usage patterns.
 
-This branch adds, on top of the cometkim integration branch below: a host-RAM KV cache tier that
-snapshots finished or still-decoding GPU lanes so a sibling request can restore instead of
-re-prefilling; prefix-reuse and admission work so concurrent identical or shared-prefix requests
-(a subagent burst sharing one long system+tools prompt) skip the redundant part of prefill entirely;
-and tagged request lanes (`@main`/`@agents`/`@classifier`, see below) so the scheduler now knows
-which lane is the long-lived conversation and protects it from eviction by short-lived traffic.
+## What's added in this fork
+
+- Host-RAM KV cache tier (two-tier probation/protected eviction) that snapshots finished or
+  still-decoding GPU lanes so a sibling request can restore instead of re-prefilling
+- Prefix-reuse and admission logic so concurrent identical or shared-prefix requests (a subagent
+  burst sharing one long system+tools prompt) skip the redundant part of prefill entirely
+- Tagged request lanes (`@main`/`@agents`/`@classifier`, see below) so the scheduler knows which
+  lane is the long-lived conversation and protects it from eviction by short-lived traffic
+- DFlash2 speculative decoding made to actually run end-to-end on this tree (gather/selector
+  addressing bugs fixed, RAM-tier KV carry for the drafter, working presets)
+- Two silent KV-corruption bugs found and fixed (a rewrite-checkpoint restore and a hyperquant
+  exact-key side store, both serving one request with another's state)
+- Streaming/tool-call-parsing hardening, adaptive MTP verification-width calibration from measured
+  round cost
+
 Measured effect: siblings that used to pay a full prefill (hundreds to thousands of ms) now restore
 in tens to a few hundred ms, and a burst of subagents sharing a system+tools prefix reuses ~99% of
-it instead of queueing behind each other's redundant prefill. Also included: adaptive MTP
-verification-width selection calibrated from measured round cost (higher decode throughput), RTX
-5090 Laptop cooperative-launch/MTP-tuning compatibility fixes carried for portability (not this
-machine's own GPU), and streaming/tool-call-parsing hardening. Two silent KV-corruption bugs found
-along the way (a rewrite-checkpoint restore and a hyperquant exact-key side store, both serving one
-request with another's state) are fixed or mitigated as noted in the details doc.
+it instead of queueing behind each other's redundant prefill.
 
-Details, rationale, and file-level pointers: [gpillon fork changes](docs/maintainer/gpillon-fork-changes.md).
+Details, rationale, and file-level pointers: [fork changes](docs/maintainer/gpillon-fork-changes.md).
+
+## Thanks
+
+- Thanks to **cometkim**: integration branch — kernel-perf (PDL decode chain, split-K prefill,
+  per-request error boundary), DFlash2 base port, hyperquant KV cache, 1M-context envelope,
+  NVFP4-full target
+- Thanks to **Mirko Covizzi**: RTX 5090 Laptop compatibility and MTP adaptive verification-width
+  tuning
+- Thanks to **mr-september**: warmup/readiness decoupling and frontend streaming fixes
+- Thanks to **dylan** (dylanbrodiefafard): RAM KV cache concept, LRU lane eviction, decode CPU-spin
+  fix
+- Thanks to **Neroued**: original NInfer engine
 
 ---
 
