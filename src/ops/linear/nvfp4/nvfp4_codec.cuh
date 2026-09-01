@@ -23,6 +23,24 @@ __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
     return static_cast<float2>(value).x;
 }
 
+// blockscale-k16-m128x4-v1 scale-plane addressing, shared by every reader of a
+// QuantLayout::BlockScaleK16M128x4 weight. The artifact writer swizzles only the
+// E4M3FN group-scale plane (swizzle_nvfp4_scales in tools/artifact/layouts.py);
+// the E2M1 code plane stays row-major, so code gathers remain plain row offsets.
+// `scale_tiles_per_row` is K / 64. nvfp4_scale_offset<Geometry> in nvfp4_gemv.cuh
+// is the compile-time wrapper over this same definition.
+__device__ __forceinline__ std::int64_t nvfp4_scale_offset(int parent_row, int group,
+                                                           int scale_tiles_per_row) {
+    const int m_tile       = parent_row / 128;
+    const int row_inner    = parent_row - m_tile * 128;
+    const int scale_tile   = group / 4;
+    const int scale_lane   = group & 3;
+    const int row_mod32    = row_inner & 31;
+    const int row_quartile = row_inner >> 5;
+    return (static_cast<std::int64_t>(m_tile) * scale_tiles_per_row + scale_tile) * 512 +
+           row_mod32 * 16 + row_quartile * 4 + scale_lane;
+}
+
 struct alignas(8) Nvfp4QuantizedK16 {
     std::uint32_t codes_lo;
     std::uint32_t codes_hi;

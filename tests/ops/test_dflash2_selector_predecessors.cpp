@@ -79,6 +79,8 @@ int main() {
     failures += run_case("predecessors k16 p7 l2", 16, 7, 2, 32);
     failures += run_case("predecessors k16 p7 l3", 16, 7, 3, 35);
     failures += run_case("predecessors k16 p7 l4", 16, 7, 4, 36);
+    failures += run_case("predecessors k16 p7 l6", 16, 7, 6, 37);
+    failures += run_case("predecessors k16 p7 l8", 16, 7, 8, 38);
     // Minimal and wide lattices.
     failures += run_case("predecessors k1 p1 l1", 1, 1, 1, 33);
     failures += run_case("predecessors k8 p15 l4", 8, 15, 4, 34);

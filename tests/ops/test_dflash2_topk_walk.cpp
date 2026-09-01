@@ -122,12 +122,16 @@ int main() {
     failures += run_topk_case("topk 248320 c14 k16", 248320, 14, 16, 34);
     failures += run_topk_case("topk 248320 c21 k16", 248320, 21, 16, 35);
     failures += run_topk_case("topk 248320 c28 k16", 248320, 28, 16, 36);
+    failures += run_topk_case("topk 248320 c42 k16", 248320, 42, 16, 37);
+    failures += run_topk_case("topk 248320 c56 k16", 248320, 56, 16, 38);
     failures += run_topk_case("topk 1000 c3 k4", 1000, 3, 4, 32);
     failures += run_topk_case("topk 33 c1 k32", 33, 1, 32, 33);
     failures += run_walk_case("walk k16 p7 l1", 16, 7, 1, 41);
     failures += run_walk_case("walk k16 p7 l2", 16, 7, 2, 42);
     failures += run_walk_case("walk k16 p7 l3", 16, 7, 3, 44);
     failures += run_walk_case("walk k16 p7 l4", 16, 7, 4, 45);
+    failures += run_walk_case("walk k16 p7 l6", 16, 7, 6, 46);
+    failures += run_walk_case("walk k16 p7 l8", 16, 7, 8, 47);
     failures += run_walk_case("walk k4 p15 l8", 4, 15, 8, 43);
     if (failures == 0) {
         std::cout << "dflash2_topk+walk: ALL PASSED\n";

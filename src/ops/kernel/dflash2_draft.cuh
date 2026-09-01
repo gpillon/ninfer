@@ -18,6 +18,7 @@ namespace ninfer::ops {
 
 using detail::decode_nvfp4_e2m1x2;
 using detail::decode_nvfp4_e4m3;
+using detail::nvfp4_scale_offset;
 
 // One thread per (channel, column): y[c, t] = sum_k w[k] * x[c, t - k],
 // zero-padded at the lane start. w[k] = dynamic[g + (H/G)*k + 2*(H/G)*side, t]
@@ -87,6 +88,17 @@ __global__ void dflash2_selector_scores_kernel(
     const std::int64_t pred_row  = static_cast<std::int64_t>(pred_id) * rank;
     const float* h               = hidden_proj + slot * rank;
 
+    // The codebooks are NVFP4 weights in QuantLayout::BlockScaleK16M128x4. Only the
+    // E4M3FN scale plane is swizzled by the artifact writer (swizzle_nvfp4_scales in
+    // tools/artifact/layouts.py); the E2M1 code plane stays row-major, so the code
+    // gathers below keep their plain `row / 2` offsets. Scales must go through the
+    // shared nvfp4_scale_offset (ops/linear/nvfp4/nvfp4_codec.cuh) - the same
+    // definition nvfp4_gemv.cuh's nvfp4_scale_offset<Geometry> wraps - addressed by
+    // the token id as the parent row, not by the flattened `id * rank` row base.
+    // This kernel is not templated on a Geometry, so kScaleTilesPerRow = K / 64 is
+    // supplied from the runtime rank.
+    const int scale_tiles_per_row = rank / 64;
+
     float local = 0.0F;
     for (int r = threadIdx.x; r < rank; r += blockDim.x) {
         const float2 succ_pair = decode_nvfp4_e2m1x2(
@@ -95,10 +107,10 @@ __global__ void dflash2_selector_scores_kernel(
             predecessor_codes[pred_row / 2 + r / 2]);
         const float succ = (r & 1) == 0 ? succ_pair.x : succ_pair.y;
         const float pred = (r & 1) == 0 ? pred_pair.x : pred_pair.y;
-        const float succ_scale =
-            decode_nvfp4_e4m3(successor_scales[succ_row / 16 + r / 16]);
-        const float pred_scale =
-            decode_nvfp4_e4m3(predecessor_scales[pred_row / 16 + r / 16]);
+        const float succ_scale = decode_nvfp4_e4m3(
+            successor_scales[nvfp4_scale_offset(succ_id, r / 16, scale_tiles_per_row)]);
+        const float pred_scale = decode_nvfp4_e4m3(
+            predecessor_scales[nvfp4_scale_offset(pred_id, r / 16, scale_tiles_per_row)]);
         local += succ * succ_scale * successor_inverse_divisor * pred * pred_scale *
                  predecessor_inverse_divisor * h[r];
     }

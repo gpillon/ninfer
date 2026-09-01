@@ -32,9 +32,45 @@ float e4m3fn_decode(unsigned code) {
     return (code & 0x80U) != 0 ? -magnitude : magnitude;
 }
 
+// Where the E4M3FN word for logical group `group` of codebook row `id` lives in
+// the blockscale-k16-m128x4-v1 scale plane.
+//
+// Derived from the layout's own description, not from the kernel's arithmetic:
+// the natural [N, K/16] scale matrix is viewed as
+//     [N/128] [4] [32] [K/64] [4]
+// - the row index splits into a 128-row tile, the quartile inside that tile and
+//   the row inside the quartile;
+// - the group index splits into a 64-column (four-group) tile and the lane
+//   inside that tile -
+// and the plane stores that view permuted to
+//     [N/128] [K/64] [32] [4] [4].
+// This mirrors swizzle_nvfp4_scales in tools/artifact/layouts.py. The code plane
+// is NOT swizzled; it stays row-major.
+std::size_t swizzled_scale_index(std::size_t id, std::size_t group, std::size_t vocab,
+                                 std::size_t rank) {
+    const std::size_t axis[5] = {
+        id / 128,        // which 128-row tile
+        (id % 128) / 32, // which quartile of that tile
+        id % 32,         // which row inside the quartile
+        group / 4,       // which 64-column tile
+        group % 4,       // which group inside that tile
+    };
+    const std::size_t extent[5] = {vocab / 128, 4, 32, rank / 64, 4};
+    const int stored_order[5]   = {0, 3, 2, 1, 4};
+    std::size_t index           = 0;
+    for (int position = 0; position < 5; ++position) {
+        const int axis_id = stored_order[position];
+        index             = index * extent[axis_id] + axis[axis_id];
+    }
+    return index;
+}
+
 // A weight-only NVFP4 codebook in the registered blockscale-k16-m128x4-v1 layout:
-// packed E2M1 code pairs, then the E4M3FN group scales at the 256-byte-aligned
-// plane, then the FP32 weight divisor.
+// packed E2M1 code pairs, then the swizzled E4M3FN group scales at the
+// 256-byte-aligned plane, then the FP32 weight divisor. The layout requires
+// vocab % 128 == 0 and rank % 64 == 0; every case below satisfies both, so the
+// plane needs no padding and its size stays vocab * rank / 16 bytes (see
+// block_scale_geometry in tools/artifact/layouts.py).
 struct Nvfp4Codebook {
     std::vector<std::uint8_t> payload;
     std::size_t scale_offset = 0;
@@ -56,9 +92,13 @@ struct Nvfp4Codebook {
         for (std::size_t i = 0; i < codes; ++i) {
             payload[i] = static_cast<std::uint8_t>(rng() & 0xFFU);
         }
-        for (std::size_t i = 0; i < scales; ++i) {
-            // Non-NaN, non-zero scale bytes keep every represented row finite and live.
-            payload[scale_offset + i] = static_cast<std::uint8_t>(0x20U + (rng() % 0x30U));
+        // Draw the natural [vocab, rank/16] scale words, then store them swizzled.
+        for (std::size_t id = 0; id < vocab; ++id) {
+            for (std::size_t group = 0; group < rank / 16; ++group) {
+                // Non-NaN, non-zero scale bytes keep every represented row finite and live.
+                const auto word = static_cast<std::uint8_t>(0x20U + (rng() % 0x30U));
+                payload[scale_offset + swizzled_scale_index(id, group, vocab, rank)] = word;
+            }
         }
         std::memcpy(payload.data() + scale_offset + scales, &divisor, sizeof(divisor));
         for (std::size_t id = 0; id < vocab; ++id) {
@@ -66,8 +106,9 @@ struct Nvfp4Codebook {
                 const unsigned pair = payload[id * rank / 2 + r / 2];
                 const unsigned nibble =
                     (r % 2 == 0) ? (pair & 0xFU) : (pair >> 4);
-                const double scale =
-                    e4m3fn_decode(payload[scale_offset + id * rank / 16 + r / 16]);
+                // Read the scale for logical (id, r / 16) back through the swizzle.
+                const double scale = e4m3fn_decode(
+                    payload[scale_offset + swizzled_scale_index(id, r / 16, vocab, rank)]);
                 decoded[id * rank + r] =
                     static_cast<double>(e2m1_decode(nibble)) * scale / static_cast<double>(divisor);
             }
@@ -213,6 +254,8 @@ int main() {
     failures += run_case("selector r256 k16 p7 l2", 256, 16, 7, 2, 4096, 22);
     failures += run_case("selector r256 k16 p7 l3", 256, 16, 7, 3, 4096, 25);
     failures += run_case("selector r256 k16 p7 l4", 256, 16, 7, 4, 4096, 26);
+    failures += run_case("selector r256 k16 p7 l6", 256, 16, 7, 6, 4096, 27);
+    failures += run_case("selector r256 k16 p7 l8", 256, 16, 7, 8, 4096, 28);
     // Minimal shapes: one candidate and one position collapse the lattice.
     failures += run_case("selector r64 k1 p1 l1", 64, 1, 1, 1, 512, 23);
     failures += run_case("selector r512 k8 p3 l4", 512, 8, 3, 4, 1024, 24);

@@ -460,7 +460,7 @@ int main() {
     failures += run_batch_case();
     // The served DFlash2 shape: an eight-column block per row over the 2048 ring, at every
     // concurrency the engine captures a decode graph for.
-    for (int batch = 2; batch <= 4; ++batch) {
+    for (int batch = 2; batch <= 6; ++batch) {
         failures += run_batch_shape_case(8, batch, 2048, 96);
         failures += run_batch_shape_case(8, batch, 2048, 3000);
     }
