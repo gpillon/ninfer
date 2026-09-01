@@ -42,6 +42,13 @@ future rebuild inherits the scrubbed base. Local branches `scrub-backup` (pre-sc
 
 ## Current state (summary)
 
+**2026-09-01, `feat/dflash2-local`: MTP7 serving preset corrected and smoke-tested.**
+`qwen3.8-27b-nvfp4full-ram-hq-e8-2b-262k.bat` now selects the required
+`models/qwen3_8_27b_nvfp4full-v2.ninfer` artifact. The current build loaded the v2 artifact
+with `--spec mtp --draft-tokens 7 --lm-head-draft --adaptive-mtp`, listened successfully, and
+served a short OpenAI Chat Completions request. The preset's existing local capacity/concurrency
+tuning remains unstaged and was intentionally not included in this fix.
+
 **WI-8 LANDED AND VERIFIED (session 16): hq-e8-2b needle retrieval is CLEAN at 32k / 304k /
 390k / 592k true tokens (yarn:2 / yarn:4) — the >262k codec garble that blocked M2 since session
 10 is fixed by the BF16 sink+recent residual window (W=512) plus half-cell subtractive dither.
