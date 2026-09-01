@@ -24,7 +24,7 @@ echo [qwen3.8-27b-nvfp4full-hq-e8-2b-262k] vision + adaptive MTP7, native 262144
   --model-id qwen3.8-27b-nvfp4full-hq-e8-2b-262k ^
   --vision ^
   --spec mtp ^
-  --draft-tokens 3 ^
+  --draft-tokens 7 ^
   --lm-head-draft ^
   --host 0.0.0.0 ^
   --port 8080 ^
@@ -34,10 +34,10 @@ echo [qwen3.8-27b-nvfp4full-hq-e8-2b-262k] vision + adaptive MTP7, native 262144
   --pending-timeout-ms 3000000 ^
   --kv-dtype hq-e8-2b ^
   --max-context 262144 ^
-  --max-concurrency 8 ^
+  --max-concurrency 4 ^
   --adaptive-mtp ^
   --kv-ram-capacity 8192 ^
-  --kv-capacity auto ^
+  --kv-capacity 420000 ^
   --max-pending-requests 50 ^
   %*
 

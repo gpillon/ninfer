@@ -19,7 +19,11 @@ set "WEIGHTS=%ROOT%models\qwen3_8_27b_nvfp4full-v2.ninfer"
 rem Full-precision per-request records, including the drafter's per-slot acceptance profile.
 rem Override by setting NINFER_JSONL before calling; the path is anchored to this script, not to
 rem whatever directory the server happens to be started from.
-if not defined NINFER_JSONL set "NINFER_JSONL=%ROOT%..	races-dflash2.jsonl"
+rem The name carries a local YYYYMMDD_HHMMSS stamp so consecutive runs keep their own records;
+rem TIME pads the hour with a space below 10, so substitute a zero before slicing it.
+set "ORA=%TIME: =0%"
+set "DATA_ORA=%DATE:~6,4%%DATE:~3,2%%DATE:~0,2%_%ORA:~0,2%%ORA:~3,2%%ORA:~6,2%"
+if not defined NINFER_JSONL set "NINFER_JSONL=%ROOT%..\logs\traces-dflash2_%DATA_ORA%.jsonl"
 set "JSONL=%NINFER_JSONL%"
 
 if not exist "%SERVER%" (
@@ -47,9 +51,9 @@ echo [qwen3.8-27b-nvfp4full-dflash2-262k] vision + DFlash2 k=7, native 262144 co
   --pending-timeout-ms 3000000 ^
   --kv-dtype hq-e8-2b ^
   --max-context 262144 ^
-  --max-concurrency 4 ^
-  --kv-ram-capacity 8192 ^
-  --kv-capacity 420000 ^
+  --max-concurrency 6 ^
+  --kv-ram-capacity 16384 ^
+  --kv-capacity 550000 ^
   --request-log-jsonl "%JSONL%" ^
   %*
 
