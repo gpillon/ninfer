@@ -12,14 +12,18 @@
 // ensure_webui_available() compares the local marker file against
 // latest/_app/version.json and, when the local copy is missing/stale/incomplete,
 // downloads the full set into a staging directory and atomically swaps it in.
-// Downloads use WinHTTP directly (the vendored httplib is built without TLS).
+// On Windows, downloads use WinHTTP directly (the vendored httplib is built
+// without TLS); on other platforms an existing local copy is used or a clear
+// error is thrown, since the auto-download path is Windows-only for now.
 
 #include "serve/webui_update.h"
 
 #include "serve/console_log.h"
 
+#if defined(_WIN32)
 #include <windows.h>
 #include <winhttp.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -30,7 +34,9 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
 #pragma comment(lib, "winhttp.lib")
+#endif
 
 namespace ninfer::serve {
 namespace {
@@ -43,13 +49,16 @@ constexpr const char* kUserAgent    = "ninfer-serve";
 constexpr const char* kMarkerFile   = ".ninfer-webui-version";
 constexpr const char* kVersionPath  = "_app/version.json";
 constexpr int kMaxAttempts          = 3;
+#if defined(_WIN32)
 constexpr DWORD kReadChunkBytes     = 1 << 20;
+#endif
 
 struct WebuiFile {
     std::string relative_path; // e.g. "index.html", "_app/immutable/..."
     uint64_t size             = 0;
 };
 
+#if defined(_WIN32)
 // RAII closer for an HINTERNET handle. The vendored httplib has no TLS, so all
 // webui downloads go through WinHTTP directly; a guard keeps every handle closed
 // on both the success and every throw path.
@@ -83,7 +92,12 @@ std::wstring to_wide(const std::string& s) {
     ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), len);
     return out;
 }
+#else
+// On POSIX, std::filesystem uses UTF-8 natively, so no wide conversion is needed.
+std::string to_utf8(const fs::path& p) { return p.string(); }
+#endif // _WIN32
 
+#if defined(_WIN32)
 // Splits "https://host/path..." into (host, path-and-query).
 void split_url(const std::string& url, std::string& host, std::string& path) {
     const size_t scheme_end = url.find("://");
@@ -206,6 +220,7 @@ std::vector<WebuiFile> fetch_file_list() {
     }
     return files;
 }
+#endif // _WIN32
 
 uint64_t file_size_or_zero(const fs::path& p) {
     std::error_code ec;
@@ -224,6 +239,7 @@ std::string read_file_text(const fs::path& p) {
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
+#if defined(_WIN32)
 // Downloads one file to dest, verifying the final byte count against expected_size
 // when it is non-zero.
 void download_file(const std::string& relative_path, const fs::path& dest, uint64_t expected_size) {
@@ -267,6 +283,7 @@ std::string fetch_latest_version() {
     }
     return version;
 }
+#endif // _WIN32
 
 bool local_copy_is_current(const fs::path& webui_dir, const std::string& version) {
     if (!directory_exists(webui_dir)) { return false; }
@@ -302,6 +319,7 @@ std::string resolve_webui_dir(const ServeOptions& options) {
     return to_utf8((dir / "webui").lexically_normal());
 }
 
+#if defined(_WIN32)
 std::string ensure_webui_available(const std::string& webui_dir) {
     const fs::path target(webui_dir);
 
@@ -381,5 +399,34 @@ std::string ensure_webui_available(const std::string& webui_dir) {
                           " MiB) installed at " + webui_dir);
     return webui_dir;
 }
+#else
+// Non-Windows fallback: the WinHTTP download path is Windows-only. Reuse a
+// complete local copy when present; otherwise surface a clear error rather than
+// silently serving a UI that cannot be fetched.
+std::string ensure_webui_available(const std::string& webui_dir) {
+    const fs::path target(webui_dir);
+
+    // Sweep staging dirs left behind by a previously interrupted run.
+    for (const auto& stale : staged_stale_dirs(target)) {
+        std::error_code ec;
+        fs::remove_all(stale, ec);
+        write_console_log(ConsoleLogLevel::Info, "removed stale webui staging directory " + to_utf8(stale));
+    }
+
+    if (directory_exists(target) && file_size_or_zero(target / "index.html") != 0) {
+        const std::string local_version = read_file_text(target / kMarkerFile);
+        write_console_log(ConsoleLogLevel::Info,
+                          local_version.empty() ? "reusing existing webui copy at " + webui_dir
+                                                : "reusing existing webui copy (version " + local_version +
+                                                      ") at " + webui_dir);
+        return webui_dir;
+    }
+
+    throw std::runtime_error(
+        "no webui copy found at " + webui_dir +
+        " and auto-download is only supported on Windows; place the prebuilt llama.cpp webui "
+        "(ggml-org/llama-ui) in that directory or set --webui-dir to an existing copy");
+}
+#endif // _WIN32
 
 } // namespace ninfer::serve
