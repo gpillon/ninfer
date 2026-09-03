@@ -92,11 +92,23 @@ __launch_bounds__(kSamplerBlock) __global__
 __launch_bounds__(kSamplerBlock) __global__
     void sampling_partial_topk_kernel(const __nv_bfloat16* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
-                                      SamplingWorkspace workspace) {
+                                      SamplingWorkspace workspace, const uint4* scatter_source,
+                                      const std::int32_t* scatter_lanes, uint4* scatter_destination,
+                                      std::int32_t scatter_vectors_per_column) {
     const int col            = static_cast<int>(blockIdx.y);
     const int partial        = static_cast<int>(blockIdx.x);
     const SamplingConfig cfg = cfg_ptr[col];
     if (partial == 0 && threadIdx.x == 0) { workspace.group_done[col] = 0; }
+    if (partial == 0 && scatter_source != nullptr) {
+        const std::int64_t source_base =
+            static_cast<std::int64_t>(col) * scatter_vectors_per_column;
+        const std::int64_t destination_base =
+            static_cast<std::int64_t>(scatter_lanes[col]) * scatter_vectors_per_column;
+        for (int vector = static_cast<int>(threadIdx.x); vector < scatter_vectors_per_column;
+             vector += static_cast<int>(blockDim.x)) {
+            scatter_destination[destination_base + vector] = scatter_source[source_base + vector];
+        }
+    }
 
     __shared__ typename SamplingPartialSort::TempStorage sort_storage;
     __shared__ unsigned long long greedy_warp_keys[kSamplerBlock / 32];

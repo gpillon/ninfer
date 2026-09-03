@@ -2,7 +2,6 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include "ninfer/ops/sampling.h"
-#include "ninfer/ops/scatter.h"
 
 #include <stdexcept>
 
@@ -38,9 +37,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
 
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
                                    envelope, hidden, logits);
-        ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
-        ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
-                    ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
+        ops::sample_and_scatter_hidden(
+            logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
+            ops::kSamplePurposeDecode, hidden, lanes, state.continuation_hidden_store,
+            state.execution.work, state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(qwen3_6::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));

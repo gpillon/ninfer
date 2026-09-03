@@ -579,6 +579,85 @@ int workspace_route_boundary_contract() {
     return failures;
 }
 
+int fused_hidden_scatter_contract() {
+    constexpr int physical_rows = 260;
+    constexpr int token_domain = 257;
+    constexpr int batch = 4;
+    constexpr int hidden_rows = 5120;
+    constexpr int slots = 6;
+
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * batch, -8.0F);
+    std::vector<int> expected_tokens(batch);
+    for (int row = 0; row < batch; ++row) {
+        expected_tokens[static_cast<std::size_t>(row)] = 17 + row * 19;
+        logits[static_cast<std::size_t>(row) * physical_rows +
+               expected_tokens[static_cast<std::size_t>(row)]] = 4.0F + row;
+    }
+    round_to_bf16(logits);
+    const std::vector<std::uint16_t> logits_bits = bf16_bits(logits);
+    std::vector<std::uint16_t> hidden(static_cast<std::size_t>(hidden_rows) * batch);
+    for (std::size_t i = 0; i < hidden.size(); ++i) {
+        hidden[i] = f32_to_bf16(static_cast<float>(static_cast<int>(i % 127) - 63) / 32.0F);
+    }
+    const std::vector<int> lanes{4, 1, 5, 0};
+    const std::uint16_t sentinel = f32_to_bf16(-13.0F);
+    std::vector<std::uint16_t> expected_destination(
+        static_cast<std::size_t>(hidden_rows) * slots, sentinel);
+    for (int row = 0; row < batch; ++row) {
+        std::copy_n(hidden.data() + static_cast<std::size_t>(row) * hidden_rows, hidden_rows,
+                    expected_destination.data() +
+                        static_cast<std::size_t>(lanes[static_cast<std::size_t>(row)]) *
+                            hidden_rows);
+    }
+
+    DeviceBuffer device_logits = to_device(logits_bits);
+    DeviceBuffer device_hidden = to_device(hidden);
+    DeviceBuffer device_lanes = to_device(lanes);
+    std::vector<ops::SamplingConfig> configs(batch);
+    DeviceBuffer device_configs = to_device(configs);
+    const std::vector<int> positions{100, 101, 102, 103};
+    DeviceBuffer device_positions = to_device(positions);
+    GuardedDeviceBuffer output(static_cast<std::size_t>(batch) * sizeof(int));
+    GuardedDeviceBuffer destination(expected_destination.size() * sizeof(std::uint16_t));
+    std::vector<std::uint16_t> initial_destination(expected_destination.size(), sentinel);
+    destination.copy_from_host(initial_destination.data(), destination.bytes());
+
+    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch});
+    Tensor output_tensor(output.data(), DType::I32, {batch});
+    Tensor positions_tensor(device_positions.p, DType::I32, {batch});
+    Tensor hidden_tensor(device_hidden.p, DType::BF16, {hidden_rows, batch});
+    Tensor lanes_tensor(device_lanes.p, DType::I32, {batch});
+    Tensor destination_tensor(destination.data(), DType::BF16, {hidden_rows, slots});
+    const std::size_t workspace_bytes =
+        ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
+    WorkspaceArena workspace(workspace_bytes);
+    ops::sample_and_scatter_hidden(
+        logits_tensor, output_tensor, token_domain,
+        static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
+        ops::kSamplePurposeDecode, hidden_tensor, lanes_tensor, destination_tensor, workspace,
+        nullptr);
+    cuda_synchronize();
+
+    int failures = 0;
+    failures += verify_exact("sample+scatter greedy tokens",
+                             from_device<int>(output.data(), batch), expected_tokens);
+    failures += verify_exact(
+        "sample+scatter exact hidden destination",
+        from_device<std::uint16_t>(destination.data(), expected_destination.size()),
+        expected_destination);
+    failures += verify_exact("sample+scatter read-only hidden",
+                             from_device<std::uint16_t>(device_hidden, hidden.size()), hidden);
+    failures += verify_exact("sample+scatter read-only lanes",
+                             from_device<int>(device_lanes, lanes.size()), lanes);
+    failures += output.verify_guards("sample+scatter output");
+    failures += destination.verify_guards("sample+scatter destination");
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << "sample+scatter workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -608,6 +687,7 @@ int main() {
     failures += real_shape_distribution_contract();
     failures += rng_key_contract();
     failures += workspace_route_boundary_contract();
+    failures += fused_hidden_scatter_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

@@ -14,6 +14,10 @@ namespace ninfer::ops::detail {
 void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                          const SamplingConfig* configs, const Tensor& logical_positions,
                          std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream);
+void sample_batch_scatter_hidden_launch(
+    const Tensor& logits, Tensor& out, std::int32_t token_domain, const SamplingConfig* configs,
+    const Tensor& logical_positions, std::int32_t purpose, const Tensor& hidden,
+    const Tensor& lanes, Tensor& continuation_hidden, DeviceSpan workspace, cudaStream_t stream);
 
 [[nodiscard]] std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain,
                                                          std::int32_t columns);

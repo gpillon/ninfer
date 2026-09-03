@@ -42,6 +42,32 @@ future rebuild inherits the scrubbed base. Local branches `scrub-backup` (pre-sc
 
 ## Current state (summary)
 
+**2026-09-02, decode launch-fragmentation item closed.** The retained sampler/scatter fusion
+reduces the shallow ordinary-decode graph from 534 to 533 nodes and measured +0.33% median decode.
+The follow-up census found no material dependency gaps and showed that the remaining short launches
+are semantic RMSNorm, GDN recurrence, and attention-reduction work rather than removable copies.
+The small-T attention route never has one split, and the GDN recurrent producer does not own a
+complete 128-element normalization row, so the two apparent follow-up fusions are not local
+epilogues. `SEPT-OPTIMIZAZION.md` records the measured costs and closes item 2; the initial 8-12%
+fragmentation estimate is refuted. A same-build/v2-artifact/HQ smoke produced valid output at 76.40
+decode tok/s. No NInfer process remained, no preset was modified by this pass, and no commit was
+created. The stronger next decode target is the dominant NVFP4 GEMV/LinearSwiGLU schedule; a
+last-CTA HQ attention reducer is only an optional tightly-gated microbenchmark.
+
+**2026-09-01, September optimization track started.** `SEPT-OPTIMIZAZION.md` is the active
+optimization work-order for the single-host RTX 5090 coding-engine product. Its first clean
+same-build/same-v2-artifact discriminator compared adaptive MTP7 with fixed-width DFlash2-7 at
+24,091 / 98,470 / 196,337 prompt tokens, HQ-E8-2B, C=4 with one request submitted at a time,
+prefix reuse off, greedy, after an equal warmup. Decode rates were MTP/DFlash2 150.1/146.7,
+103.6/131.9, and 79.1/144.0 tok/s: DFlash2 changes by -2.3%, +27.3%, and +82.0% as depth grows,
+but pays 0.46 / 1.73 / 5.27 s additional TTFT. The phase-rate break-even is roughly 840 generated
+tokens at 98K and 925 at 196K. Synthetic greedy termination differed at 24K and 98K, so this is a
+depth/performance discriminator, not yet a backend-selection or behavioral-equivalence result.
+Next: run both backends on a replayable coding/reasoning/tool corpus with output audit, then the
+relevant concurrency points. The earlier first attempt in `profiles/sept-opt-mtp7.*` is explicitly
+rejected because another NInfer process was resident at its startup; the admitted raw records are
+`profiles/sept-opt-clean-{mtp7,dflash2}.jsonl`. No benchmark server remains running.
+
 **2026-09-01, `feat/dflash2-local`: MTP7 serving preset corrected and smoke-tested.**
 `qwen3.8-27b-nvfp4full-ram-hq-e8-2b-262k.bat` now selects the required
 `models/qwen3_8_27b_nvfp4full-v2.ninfer` artifact. The current build loaded the v2 artifact

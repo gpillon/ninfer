@@ -76,4 +76,17 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * Samples exactly as sample() while also copying hidden[:,b] to
+ * continuation_hidden[:,lanes[b]]. The registered fused route is the Qwen 27B multiblock sampler:
+ * hidden is contiguous BF16 [5120,B], lanes is contiguous I32 [B], and continuation_hidden is
+ * contiguous BF16 [5120,S]. Sampling and the exact scatter are independent outputs of one Op;
+ * neither output is allowed to alias an input or the other output.
+ */
+void sample_and_scatter_hidden(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+                               const SamplingConfig* configs, const Tensor& logical_positions,
+                               std::int32_t purpose, const Tensor& hidden, const Tensor& lanes,
+                               Tensor& continuation_hidden, WorkspaceArena& workspace,
+                               cudaStream_t stream);
+
 } // namespace ninfer::ops

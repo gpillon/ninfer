@@ -13,6 +13,7 @@ rem Extra flags pass through after the preset (later duplicates override earlier
 
 set "ROOT=%~dp0"
 set "SERVER=%ROOT%build-ninja\apps\ninfer-serve.exe"
+:: set "SERVER=%ROOT%..\ninfer-build-giorgio-post-dflash2\ninfer-serve.exe"
 rem The module is part of the nvfp4full identity's complete image, so the engine requires the
 rem dflash2/* objects under this profile whatever --spec says: only the v2 artifact loads.
 set "WEIGHTS=%ROOT%models\qwen3_8_27b_nvfp4full-v2.ninfer"

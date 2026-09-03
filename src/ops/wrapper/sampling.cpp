@@ -9,19 +9,10 @@
 
 namespace ninfer::ops {
 
-std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::int32_t min_lanes,
-                                              std::int32_t max_lanes) {
-    if (token_domain <= 0 || min_lanes <= 0 || max_lanes < min_lanes) {
-        throw std::invalid_argument("sampling workspace: invalid profile or lane interval");
-    }
-    if (token_domain <= kSamplerTileItems || min_lanes > kSamplerMaxColumns) { return 0; }
-    return detail::sampling_workspace_exact_bytes(token_domain,
-                                                  std::min(max_lanes, kSamplerMaxColumns));
-}
+namespace {
 
-void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
-            const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            WorkspaceArena& workspace, cudaStream_t stream) {
+void validate_sample(const Tensor& logits, const Tensor& out, std::int32_t token_domain,
+                     const SamplingConfig* configs, const Tensor& logical_positions) {
     if (logits.dtype != DType::BF16) { throw std::invalid_argument("sample: logits must be BF16"); }
     if (out.dtype != DType::I32) { throw std::invalid_argument("sample: out must be I32"); }
     if (logits.ne[2] != 1 || logits.ne[3] != 1) {
@@ -50,6 +41,24 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
         throw std::invalid_argument("sample: tensor data must be non-null");
     }
     if (configs == nullptr) { throw std::invalid_argument("sample: configs must be non-null"); }
+}
+
+} // namespace
+
+std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::int32_t min_lanes,
+                                              std::int32_t max_lanes) {
+    if (token_domain <= 0 || min_lanes <= 0 || max_lanes < min_lanes) {
+        throw std::invalid_argument("sampling workspace: invalid profile or lane interval");
+    }
+    if (token_domain <= kSamplerTileItems || min_lanes > kSamplerMaxColumns) { return 0; }
+    return detail::sampling_workspace_exact_bytes(token_domain,
+                                                  std::min(max_lanes, kSamplerMaxColumns));
+}
+
+void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+            const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
+            WorkspaceArena& workspace, cudaStream_t stream) {
+    validate_sample(logits, out, token_domain, configs, logical_positions);
 
     auto scratch_scope = workspace.scope();
     const std::size_t bytes =
@@ -57,6 +66,38 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::sample_batch_launch(logits, out, token_domain, configs, logical_positions, purpose,
                                 scratch, stream);
+}
+
+void sample_and_scatter_hidden(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+                               const SamplingConfig* configs, const Tensor& logical_positions,
+                               std::int32_t purpose, const Tensor& hidden, const Tensor& lanes,
+                               Tensor& continuation_hidden, WorkspaceArena& workspace,
+                               cudaStream_t stream) {
+    validate_sample(logits, out, token_domain, configs, logical_positions);
+    const std::int32_t batch = logits.ne[1];
+    if (hidden.dtype != DType::BF16 || hidden.ne[0] != 5120 || hidden.ne[1] != batch ||
+        hidden.ne[2] != 1 || hidden.ne[3] != 1 || lanes.dtype != DType::I32 ||
+        lanes.ne[0] != batch || lanes.ne[1] != 1 || lanes.ne[2] != 1 || lanes.ne[3] != 1 ||
+        continuation_hidden.dtype != DType::BF16 || continuation_hidden.ne[0] != 5120 ||
+        continuation_hidden.ne[1] < batch || continuation_hidden.ne[2] != 1 ||
+        continuation_hidden.ne[3] != 1) {
+        throw std::invalid_argument("sample_and_scatter_hidden: invalid hidden/lane shape");
+    }
+    if (!hidden.is_contiguous() || !lanes.is_contiguous() ||
+        !continuation_hidden.is_contiguous() || hidden.data == nullptr || lanes.data == nullptr ||
+        continuation_hidden.data == nullptr || hidden.data == continuation_hidden.data) {
+        throw std::invalid_argument(
+            "sample_and_scatter_hidden: hidden/lane tensors must be non-null and non-aliasing");
+    }
+    auto scratch_scope = workspace.scope();
+    const std::size_t bytes = sampling_workspace_capacity_bytes(token_domain, batch, batch);
+    if (bytes == 0) {
+        throw std::invalid_argument("sample_and_scatter_hidden: multiblock sampler is required");
+    }
+    const DeviceSpan scratch = workspace.alloc_bytes(bytes);
+    detail::sample_batch_scatter_hidden_launch(
+        logits, out, token_domain, configs, logical_positions, purpose, hidden, lanes,
+        continuation_hidden, scratch, stream);
 }
 
 } // namespace ninfer::ops
